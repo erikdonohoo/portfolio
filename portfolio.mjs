@@ -104,10 +104,11 @@ usage: node portfolio.mjs [options]
   --json                 emit JSON instead of a table
   --no-color             plain output
   --gulp-emissions       simulate pool.gulp_emissions() for each Blend pool (read-only)
-  --submit               with --gulp-emissions, sign and broadcast; needs STELLAR_SECRET_KEY
+  --submit               with --gulp-emissions, sign and broadcast; needs a signing key
   -h, --help             this text
 
-env: HORIZON_URL, STELLAR_RPC_URL, SOLANA_RPC_URL, PORTFOLIO_CONFIG, STELLAR_SECRET_KEY
+env: HORIZON_URL, STELLAR_RPC_URL, SOLANA_RPC_URL, PORTFOLIO_CONFIG,
+     STELLAR_SECRET_KEY or STELLAR_SECRET_KEY_FILE (path to a file holding it)
 `.trim();
 
 /* ---------------------------------------------------------------- http */
@@ -453,9 +454,16 @@ async function gulpEmissions(poolId, version, sourceAddress, submit) {
 }
 
 function requireSecret() {
-  const secret = process.env.STELLAR_SECRET_KEY;
-  if (!secret) throw new Error('--submit needs STELLAR_SECRET_KEY in the environment');
-  return secret;
+  if (process.env.STELLAR_SECRET_KEY) return process.env.STELLAR_SECRET_KEY.trim();
+
+  const path = process.env.STELLAR_SECRET_KEY_FILE;
+  if (path) {
+    if (!existsSync(path)) throw new Error(`STELLAR_SECRET_KEY_FILE not found: ${path}`);
+    const secret = readFileSync(path, 'utf8').trim();
+    if (!secret) throw new Error(`STELLAR_SECRET_KEY_FILE is empty: ${path}`);
+    return secret;
+  }
+  throw new Error('--submit needs STELLAR_SECRET_KEY or STELLAR_SECRET_KEY_FILE in the environment');
 }
 
 /* ---------------------------------------------------------------- valuation */
@@ -739,7 +747,9 @@ async function main() {
     }));
     if (gulps) {
       console.log('');
-      console.log(`gulp_emissions (${opts.flags.has('submit') ? 'submitted' : 'simulation only, pass --submit to send'})`);
+      console.log(opts.flags.has('submit')
+        ? `gulp_emissions (${gulps.filter((g) => g.submitted).length}/${gulps.length} submitted)`
+        : 'gulp_emissions (simulation only, pass --submit to send)');
       for (const g of gulps) {
         if (g.error) {
           console.log(`  ${g.poolId}  FAILED  ${g.error}`);

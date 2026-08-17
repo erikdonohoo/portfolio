@@ -121,12 +121,32 @@ gulp_emissions (simulation only, pass --submit to send)
   CDMAVJPFXPADND3YRL4BSM3AKZWCTFMX27GLLXCML3PD62HEQS5FPVAI  1,901.6 BLND  fee 0.023051 XLM
 ```
 
-To actually send it, supply a key and opt in explicitly:
+To actually send it, supply a signing key and opt in explicitly:
 
 ```bash
 STELLAR_SECRET_KEY=S... node portfolio.mjs --gulp-emissions --submit
 ```
 
-It simulates first either way, so a call that would fail never reaches the network. The
-secret key is only ever read from the environment, never a flag or the config file, so it
-stays out of your shell history.
+It simulates first either way, so a call that would fail never reaches the network.
+
+### Where to put the key
+
+The key is only ever read from the environment, never a flag and never `wallets.json`, so it
+cannot end up in the repo. Three ways in, best first:
+
+```bash
+# 1. from a password manager, so it never touches disk or shell history
+STELLAR_SECRET_KEY=$(op read "op://Private/Stellar/secret key") \
+  node portfolio.mjs --gulp-emissions --submit
+
+# 2. from a gitignored file
+echo 'S...' > ~/.stellar-gulp-key && chmod 600 ~/.stellar-gulp-key
+STELLAR_SECRET_KEY_FILE=~/.stellar-gulp-key node portfolio.mjs --gulp-emissions --submit
+
+# 3. inline, which does land in shell history
+STELLAR_SECRET_KEY=S... node portfolio.mjs --gulp-emissions --submit
+```
+
+**It does not have to be the key for the wallet you are valuing.** `gulp_emissions` is
+permissionless and touches none of your positions, so the signer can be any funded account.
+Use a throwaway with a few XLM in it and your main key never comes near this script.
