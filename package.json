@@ -1,0 +1,20 @@
+{
+  "name": "portfolio-value",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Total USD value of Stellar (including Blend pool + backstop) and Solana holdings",
+  "type": "module",
+  "bin": {
+    "portfolio": "./portfolio.mjs"
+  },
+  "scripts": {
+    "start": "node portfolio.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@blend-capital/blend-sdk": "3.2.2",
+    "@stellar/stellar-sdk": "14.4.3"
+  }
+}
