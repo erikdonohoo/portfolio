@@ -17,7 +17,7 @@ import {
   ContractErrorType,
   parseError,
 } from '@blend-capital/blend-sdk';
-import { BASE_FEE, Keypair, Networks, TransactionBuilder, rpc, xdr } from '@stellar/stellar-sdk';
+import { Address, BASE_FEE, Contract, Keypair, Networks, TransactionBuilder, rpc, scValToNative, xdr } from '@stellar/stellar-sdk';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -354,6 +354,35 @@ function reserveEmissions(reserve) {
   };
 }
 
+/**
+ * What `claim` would actually pay out, by simulating it. The SDK's estimateEmissions is a
+ * reimplementation of the same accrual and lands a hair off; the contract is the authority,
+ * and this is the number Blend's own UI shows. Returns undefined so callers can fall back.
+ */
+async function claimableEmissions(poolId, pool, user) {
+  const tokenIds = [];
+  for (const reserve of pool.reserves.values()) {
+    tokenIds.push(reserve.getBTokenEmissionIndex(), reserve.getDTokenEmissionIndex());
+  }
+  tokenIds.sort((a, b) => a - b);
+
+  const server = new rpc.Server(STELLAR_RPC);
+  const account = await server.getAccount(user);
+  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
+    .addOperation(new Contract(poolId).call(
+      'claim',
+      new Address(user).toScVal(),
+      xdr.ScVal.scvVec(tokenIds.map((id) => xdr.ScVal.scvU32(id))),
+      new Address(user).toScVal(),
+    ))
+    .setTimeout(60)
+    .build();
+
+  const sim = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(sim)) return undefined;
+  return Number(scValToNative(sim.result.retval)) / 1e7;
+}
+
 async function readBlendPool(poolId, users) {
   const { pool, version } = await loadPool(poolId);
   const [oracle, backstop, tokens] = await Promise.all([
@@ -398,7 +427,17 @@ async function readBlendPool(poolId, users) {
     return {
       address,
       legs,
-      emissions: poolUser.estimateEmissions([...pool.reserves.values()]).emissions,
+      ...(await (async () => {
+        const estimated = poolUser.estimateEmissions([...pool.reserves.values()]).emissions;
+        const claimable = await claimableEmissions(poolId, pool, address).catch(() => undefined);
+        if (claimable === undefined && estimated > 0) {
+          warn(`could not simulate claim on pool ${poolId}, showing the SDK estimate instead`);
+        }
+        return {
+          emissions: claimable ?? estimated,
+          emissionsSource: claimable === undefined ? 'blend-sdk-estimate' : 'claim-simulated',
+        };
+      })()),
       backstop: {
         deposited: bs.tokens,
         queued: queuedTokens,
@@ -587,10 +626,16 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
           rate: fmtLegRate(leg, v.price, blndPrice),
         });
       }
-      if (position.emissions > 0) {
+      if (position.emissions > 0 || rows.length) {
         const key = stellarKey(blend.blndMeta.symbol, blend.blndMeta.asset?.getIssuer());
         const v = value(key, position.emissions, 'BLND (pool emissions)');
-        rows.push({ label: 'BLND emissions (unclaimed)', amount: position.emissions, ...v });
+        rows.push({
+          label: 'unclaimed emissions',
+          amount: position.emissions,
+          ...v,
+          source: position.emissionsSource,
+          pinned: true,
+        });
       }
       sections.push({ title: `Blend ${blend.version} pool "${blend.name}" supplied - ${blend.poolId}`, rows });
 
@@ -617,7 +662,7 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
       if (bs.emissions > 0) {
         const key = stellarKey(blend.blndMeta.symbol, blend.blndMeta.asset?.getIssuer());
         const v = value(key, bs.emissions, 'BLND (backstop emissions)');
-        bsRows.push({ label: 'BLND emissions (unclaimed)', amount: bs.emissions, ...v });
+        bsRows.push({ label: 'unclaimed emissions', amount: bs.emissions, ...v, pinned: true });
       }
       if (bsRows.length) {
         sections.push({ title: `Blend backstop "${blend.name}" - ${blend.poolId}`, rows: bsRows });
@@ -637,7 +682,7 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
     sections.push({ title: `Solana wallet ${account.address}`, rows });
   }
 
-  return { sections, unpriced };
+  return { sections, unpriced, generatedAt: new Date() };
 }
 
 // Prefer the pool's own on-chain oracle for reserve assets; fall back to the
@@ -701,18 +746,35 @@ function fmtLegRate(leg, assetPrice, blndPrice) {
 
 const fmtPct = (n, unit = true) => (n === undefined ? '-' : `${(n * 100).toFixed(2)}${unit ? '%' : ''}`);
 
+// Local time, so "when did I check this" reads at a glance, with the zone spelled out
+// because these runs get pasted into chats and issues where the reader's zone differs.
+const fmtStamp = (d) => {
+  const local = d.toLocaleString('sv-SE').replace(',', '');
+  const zone = new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' })
+    .formatToParts(d)
+    .find((part) => part.type === 'timeZoneName')?.value ?? '';
+  return `${local} ${zone}`.trim();
+};
+
 function render(report, { color, showAll, minValue }) {
   const dim = (s) => (color ? `\x1b[2m${s}\x1b[0m` : s);
   const bold = (s) => (color ? `\x1b[1m${s}\x1b[0m` : s);
   const out = [];
   let total = 0;
 
+  out.push(dim(`as of ${fmtStamp(report.generatedAt)}`));
+
   for (const section of report.sections) {
-    const visible = section.rows.filter((r) => showAll || (r.amount !== 0 && Math.abs(r.usd) >= minValue));
-    const hidden = section.rows.filter((r) => !visible.includes(r) && r.amount !== 0);
+    // Emissions are claimable rewards rather than positions, so they are pinned below the
+    // position rows and exempt from the dust threshold. Hiding a claim behind --min-value
+    // makes it look like nothing has accrued.
+    const positions = section.rows.filter((r) => !r.pinned);
+    const pinned = section.rows.filter((r) => r.pinned);
+    const visible = positions.filter((r) => showAll || (r.amount !== 0 && Math.abs(r.usd) >= minValue));
+    const hidden = positions.filter((r) => !visible.includes(r) && r.amount !== 0);
     const subtotal = section.rows.reduce((sum, r) => sum + r.usd, 0);
     total += subtotal;
-    if (!visible.length && !hidden.length) continue;
+    if (!visible.length && !hidden.length && !pinned.length) continue;
 
     out.push('');
     out.push(bold(section.title));
@@ -723,6 +785,9 @@ function render(report, { color, showAll, minValue }) {
     if (hidden.length) {
       const hiddenUsd = hidden.reduce((sum, r) => sum + r.usd, 0);
       table.push([`${hidden.length} position${hidden.length > 1 ? 's' : ''} under ${fmtUsd(minValue)}`, '', '', fmtUsd(hiddenUsd), '', '--all']);
+    }
+    for (const r of pinned) {
+      table.push([r.label, `${fmtQty(r.amount)} BLND`, fmtPrice(r.price), fmtUsd(r.usd), '', r.source]);
     }
     const widths = [0, 1, 2, 3, 4, 5].map((i) => Math.max(...table.map((row) => row[i].length)));
     for (const row of table) {
@@ -834,7 +899,7 @@ async function main() {
   if (opts.flags.has('json')) {
     const total = report.sections.flatMap((s) => s.rows).reduce((sum, r) => sum + r.usd, 0);
     console.log(JSON.stringify({
-      generatedAt: new Date().toISOString(),
+      generatedAt: report.generatedAt.toISOString(),
       totalUsd: total,
       sections: report.sections,
       unpriced: report.unpriced,

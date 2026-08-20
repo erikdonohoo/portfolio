@@ -85,6 +85,25 @@ than a cost, so they subtract: a 10.92% borrow rate with 0.29% emissions shows a
 breakdown plus utilization and the date emissions run out. That is the view for deciding where
 to move a balance.
 
+### Unclaimed emissions
+
+Accrued BLND is listed on its own line below the positions, in both the pool and the backstop
+sections. It is deliberately kept out of the position rows and exempt from `--min-value`: a
+claimable reward that reads as `$0.00` because it is worth less than a cent is still something
+you can act on, and collapsing it into "1 position under $0.01" makes it look like nothing has
+accrued at all.
+
+```
+USDC (net of 1,000 borrowed)         -1,000      $1.0004  -$1,000.42              -2.70%  blend-oracle
+unclaimed emissions           0.203935 BLND  $0.04200468       $0.01                      claim-simulated
+                                                  subtotal   $2,301.80
+```
+
+The `claim-simulated` source means the figure came from simulating the pool's own `claim` call,
+which is the authority and the same number Blend's UI shows. The SDK ships an `estimateEmissions`
+helper that reimplements the accrual, but it lands a hair off, so it is only used as a fallback
+when the simulation cannot run; the source column says `blend-sdk-estimate` when that happens.
+
 ## What it counts
 
 **Stellar** (Horizon): XLM, every trustline balance, liquidity pool shares broken down into
