@@ -14,6 +14,8 @@ import {
   PoolV1,
   PoolV2,
   TokenMetadata,
+  ContractErrorType,
+  parseError,
 } from '@blend-capital/blend-sdk';
 import { BASE_FEE, Keypair, Networks, TransactionBuilder, rpc, xdr } from '@stellar/stellar-sdk';
 
@@ -56,6 +58,7 @@ function parseArgs(argv) {
         break;
       }
       case '--json': case '--all': case '--gulp-emissions': case '--submit': case '--no-color':
+      case '--rates':
         opts.flags.add(arg.slice(2));
         break;
       case '-h': case '--help': opts.flags.add('help'); break;
@@ -103,6 +106,7 @@ usage: node portfolio.mjs [options]
   --all                  show every position, including zero balances and dust
   --json                 emit JSON instead of a table
   --no-color             plain output
+  --rates                every reserve's supply and borrow APY, across all pools
   --gulp-emissions       simulate pool.gulp_emissions() for each Blend pool (read-only)
   --submit               with --gulp-emissions, sign and broadcast; needs a signing key
   -h, --help             this text
@@ -327,6 +331,29 @@ async function loadPool(poolId) {
   }
 }
 
+/**
+ * BLND emission rates for a reserve, as the raw pieces rather than a percentage: the
+ * APR depends on the BLND and asset prices, which are only resolved later in the price
+ * book. Emissions accrue per bToken/dToken, so the underlying per token is needed to
+ * put the reward and the position on the same footing. Expired emissions count as none.
+ */
+function reserveEmissions(reserve) {
+  const decimals = reserve.config.decimals;
+  const oneToken = BigInt(10) ** BigInt(decimals);
+  const side = (emissions, tokenSupply, assetPerToken) => {
+    if (!emissions || emissions.expiration * 1000 < Date.now()) return undefined;
+    return {
+      blndPerYearPerToken: emissions.emissionsPerYearPerToken(tokenSupply, decimals),
+      assetPerToken,
+      expiration: emissions.expiration,
+    };
+  };
+  return {
+    supplyEmissions: side(reserve.supplyEmissions, reserve.data.bSupply, reserve.toAssetFromBTokenFloat(oneToken)),
+    borrowEmissions: side(reserve.borrowEmissions, reserve.data.dSupply, reserve.toAssetFromDTokenFloat(oneToken)),
+  };
+}
+
 async function readBlendPool(poolId, users) {
   const { pool, version } = await loadPool(poolId);
   const [oracle, backstop, tokens] = await Promise.all([
@@ -353,7 +380,16 @@ async function readBlendPool(poolId, users) {
       const collateral = poolUser.getCollateralFloat(reserve);
       const borrowed = poolUser.getLiabilitiesFloat(reserve);
       if (!supply && !collateral && !borrowed) continue;
-      legs.push({ assetId, meta: tokenMeta.get(assetId), supply, collateral, borrowed });
+      legs.push({
+        assetId,
+        meta: tokenMeta.get(assetId),
+        supply,
+        collateral,
+        borrowed,
+        supplyApy: reserve.estSupplyApy,
+        borrowApy: reserve.estBorrowApy,
+        ...reserveEmissions(reserve),
+      });
     }
 
     const bs = BackstopPoolUserEst.build(backstop, backstopPool, backstopUser);
@@ -375,7 +411,16 @@ async function readBlendPool(poolId, users) {
     };
   }));
 
-  return { poolId, version, name: pool.metadata.name, pool, oracle, tokenMeta, blndMeta, positions };
+  const rates = [...pool.reserves].map(([assetId, reserve]) => ({
+    assetId,
+    symbol: tokenMeta.get(assetId)?.symbol ?? assetId.slice(0, 8),
+    supplyApy: reserve.estSupplyApy,
+    borrowApy: reserve.estBorrowApy,
+    utilization: reserve.getUtilizationFloat(),
+    ...reserveEmissions(reserve),
+  }));
+
+  return { poolId, version, name: pool.metadata.name, pool, oracle, tokenMeta, blndMeta, positions, rates };
 }
 
 /* ---------------------------------------------------------------- solana wallet */
@@ -391,8 +436,12 @@ async function readSolanaAccount(address) {
   for (const set of tokenSets) {
     for (const acct of set.value ?? []) {
       const info = acct.account.data.parsed.info;
-      const amount = Number(info.tokenAmount.uiAmountString);
-      const prev = byMint.get(info.mint) ?? { mint: info.mint, amount: 0, decimals: info.tokenAmount.decimals };
+      // uiAmount applies the Token-2022 interest-bearing multiplier, but transfers,
+      // AMMs and therefore Jupiter prices all work off the raw amount. Use raw so the
+      // quantity matches what a wallet shows and the price is on the same basis.
+      const decimals = info.tokenAmount.decimals;
+      const amount = Number(info.tokenAmount.amount) / 10 ** decimals;
+      const prev = byMint.get(info.mint) ?? { mint: info.mint, amount: 0, decimals };
       prev.amount += amount;
       byMint.set(info.mint, prev);
     }
@@ -423,7 +472,11 @@ async function gulpEmissions(poolId, version, sourceAddress, submit) {
     .build();
 
   const sim = await server.simulateTransaction(tx);
-  if (rpc.Api.isSimulationError(sim)) return { poolId, submitted: false, error: sim.error };
+  if (rpc.Api.isSimulationError(sim)) {
+    // Raw Soroban simulation errors carry the whole diagnostic event log, which is
+    // unreadable in a table. The Blend SDK maps the contract code to a name.
+    return { poolId, submitted: false, error: describeContractError(sim) };
+  }
 
   const gulped = sim.result?.retval ? Number(parser(sim.result.retval.toXDR('base64'))) / 1e7 : 0;
   const prepared = rpc.assembleTransaction(tx, sim).build();
@@ -451,6 +504,17 @@ async function gulpEmissions(poolId, version, sourceAddress, submit) {
     return result;
   }
   return { ...result, status: 'TIMEOUT', error: 'transaction not confirmed in 60s' };
+}
+
+// Turn a Soroban simulation failure into one short line, e.g. "BackstopBadRequest (1000)".
+function describeContractError(sim) {
+  try {
+    const code = parseError(sim).type;
+    const name = ContractErrorType[code];
+    return name ? `${name} (${code})` : `contract error ${code}`;
+  } catch {
+    return String(sim.error ?? 'simulation failed').split('\n')[0];
+  }
 }
 
 function requireSecret() {
@@ -506,6 +570,7 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
   }
 
   for (const blend of blendPools) {
+    const blndPrice = priceOf(stellarKey(blend.blndMeta.symbol, blend.blndMeta.asset?.getIssuer()))?.usd;
     for (const position of blend.positions) {
       const rows = [];
       for (const leg of position.legs) {
@@ -519,6 +584,7 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
           price: v.price,
           source: v.source,
           usd: net < 0 ? -v.usd : v.usd,
+          rate: fmtLegRate(leg, v.price, blndPrice),
         });
       }
       if (position.emissions > 0) {
@@ -603,6 +669,38 @@ const fmtPrice = (n) => {
   return `$${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: n < 1 ? 8 : 4 })}`;
 };
 
+// Turn emission pieces into an APR. Rewards are paid in BLND per bToken/dToken per year,
+// so both the reward and the position have to be converted to USD before dividing.
+function emissionsApr(emissions, assetPrice, blndPrice) {
+  if (!emissions || !assetPrice || !blndPrice) return 0;
+  const perTokenUsd = emissions.assetPerToken * assetPrice;
+  if (perTokenUsd <= 0) return 0;
+  return (emissions.blndPerYearPerToken * blndPrice) / perTokenUsd;
+}
+
+// All-in APY on the side the position actually sits on: earning shows +, paying shows -.
+// Supply emissions add to what you earn; borrow emissions are a rebate on what you pay,
+// so they subtract. The breakdown is shown only when emissions actually contribute.
+function fmtLegRate(leg, assetPrice, blndPrice) {
+  const withBreakdown = (base, emis, sign) => {
+    const net = base + sign * emis;
+    const shown = `${net < 0 ? '-' : '+'}${fmtPct(Math.abs(net))}`;
+    if (emis === 0) return shown;
+    return `${shown} (${fmtPct(base, false)}${sign > 0 ? '+' : '-'}${fmtPct(emis, false)})`;
+  };
+
+  const parts = [];
+  if (leg.supply + leg.collateral > 0) {
+    parts.push(withBreakdown(leg.supplyApy, emissionsApr(leg.supplyEmissions, assetPrice, blndPrice), +1));
+  }
+  if (leg.borrowed > 0) {
+    parts.push(withBreakdown(-leg.borrowApy, emissionsApr(leg.borrowEmissions, assetPrice, blndPrice), +1));
+  }
+  return parts.join(' / ') || undefined;
+}
+
+const fmtPct = (n, unit = true) => (n === undefined ? '-' : `${(n * 100).toFixed(2)}${unit ? '%' : ''}`);
+
 function render(report, { color, showAll, minValue }) {
   const dim = (s) => (color ? `\x1b[2m${s}\x1b[0m` : s);
   const bold = (s) => (color ? `\x1b[1m${s}\x1b[0m` : s);
@@ -621,19 +719,23 @@ function render(report, { color, showAll, minValue }) {
     const table = visible
       .slice()
       .sort((a, b) => b.usd - a.usd)
-      .map((r) => [r.label, fmtQty(r.amount), fmtPrice(r.price), fmtUsd(r.usd), r.source]);
+      .map((r) => [r.label, fmtQty(r.amount), fmtPrice(r.price), fmtUsd(r.usd), r.rate ?? '', r.source]);
     if (hidden.length) {
       const hiddenUsd = hidden.reduce((sum, r) => sum + r.usd, 0);
-      table.push([`${hidden.length} position${hidden.length > 1 ? 's' : ''} under ${fmtUsd(minValue)}`, '', '', fmtUsd(hiddenUsd), '--all']);
+      table.push([`${hidden.length} position${hidden.length > 1 ? 's' : ''} under ${fmtUsd(minValue)}`, '', '', fmtUsd(hiddenUsd), '', '--all']);
     }
-    const widths = [0, 1, 2, 3, 4].map((i) => Math.max(...table.map((row) => row[i].length)));
+    const widths = [0, 1, 2, 3, 4, 5].map((i) => Math.max(...table.map((row) => row[i].length)));
     for (const row of table) {
       out.push(
         `  ${row[0].padEnd(widths[0])}  ${row[1].padStart(widths[1])}  ` +
-        `${row[2].padStart(widths[2])}  ${row[3].padStart(widths[3])}  ${dim(row[4])}`,
+        `${row[2].padStart(widths[2])}  ${row[3].padStart(widths[3])}  ` +
+        `${row[4].padStart(widths[4])}  ${dim(row[5])}`,
       );
     }
-    out.push(`  ${''.padEnd(widths[0])}  ${''.padStart(widths[1])}  ${'subtotal'.padStart(widths[2])}  ${bold(fmtUsd(subtotal).padStart(widths[3]))}`);
+    out.push(
+      `  ${''.padEnd(widths[0])}  ${''.padStart(widths[1])}  ${'subtotal'.padStart(widths[2])}  ` +
+      `${bold(fmtUsd(subtotal).padStart(widths[3]))}`,
+    );
   }
 
   out.push('');
@@ -666,7 +768,7 @@ async function main() {
   }
   const config = loadConfig(opts);
   if (!config.stellar.length && !config.solana.length) {
-    console.error('no wallets configured. pass --stellar/--solana or create wallets.json\n');
+    console.error('no wallets configured. pass --stellar/--solana, or copy wallets.json.example to wallets.json\n');
     console.error(USAGE);
     return 2;
   }
@@ -736,6 +838,18 @@ async function main() {
       totalUsd: total,
       sections: report.sections,
       unpriced: report.unpriced,
+      blendRates: opts.flags.has('rates')
+        ? blendPools.flatMap((b) => {
+            const blndPrice = book.get(stellarKey(b.blndMeta.symbol, b.blndMeta.asset?.getIssuer()))?.usd;
+            return b.rates.map((r) => ({
+              pool: b.name,
+              poolId: b.poolId,
+              ...r,
+              supplyEmissionsApy: emissionsApr(r.supplyEmissions, b.oracle.getPriceFloat(r.assetId), blndPrice),
+              borrowEmissionsApy: emissionsApr(r.borrowEmissions, b.oracle.getPriceFloat(r.assetId), blndPrice),
+            }));
+          })
+        : undefined,
       gulpEmissions: gulps,
       warnings,
     }, null, 2));
@@ -745,6 +859,43 @@ async function main() {
       showAll: opts.flags.has('all'),
       minValue: opts.minValue ?? 0.01,
     }));
+    if (opts.flags.has('rates')) {
+      console.log('');
+      console.log('Blend rates (estimated APY, all-in. supply = interest + emissions, borrow = interest - emissions)');
+      const rows = [];
+      for (const blend of blendPools) {
+        const blndPrice = book.get(stellarKey(blend.blndMeta.symbol, blend.blndMeta.asset?.getIssuer()))?.usd;
+        for (const r of blend.rates) {
+          const assetPrice = blend.oracle.getPriceFloat(r.assetId);
+          const supplyEmis = emissionsApr(r.supplyEmissions, assetPrice, blndPrice);
+          const borrowEmis = emissionsApr(r.borrowEmissions, assetPrice, blndPrice);
+          const cell = (base, emis) => {
+            if (emis === 0) return fmtPct(base);
+            const sign = emis < 0 ? '-' : '+';
+            return `${fmtPct(base + emis)} (${fmtPct(base, false)}${sign}${fmtPct(Math.abs(emis), false)})`;
+          };
+          const ends = [r.supplyEmissions?.expiration, r.borrowEmissions?.expiration].filter(Boolean);
+          rows.push([
+            blend.name,
+            r.symbol,
+            cell(r.supplyApy, supplyEmis),
+            cell(r.borrowApy, -borrowEmis),
+            `${(r.utilization * 100).toFixed(1)}%`,
+            ends.length ? new Date(Math.min(...ends) * 1000).toISOString().slice(0, 10) : '',
+          ]);
+        }
+      }
+      rows.sort((a, b) => a[1].localeCompare(b[1]) || a[0].localeCompare(b[0]));
+      const head = ['pool', 'asset', 'supply', 'borrow', 'util', 'emissions end'];
+      const widths = head.map((_, i) => Math.max(head[i].length, ...rows.map((r) => r[i].length)));
+      const line = (r) =>
+        `  ${r[0].padEnd(widths[0])}  ${r[1].padEnd(widths[1])}  ` +
+        `${r[2].padStart(widths[2])}  ${r[3].padStart(widths[3])}  ` +
+        `${r[4].padStart(widths[4])}  ${r[5].padStart(widths[5])}`;
+      console.log(line(head));
+      for (const r of rows) console.log(line(r));
+    }
+
     if (gulps) {
       console.log('');
       console.log(opts.flags.has('submit')

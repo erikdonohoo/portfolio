@@ -2,19 +2,23 @@
   "name": "portfolio-value",
   "version": "1.0.0",
   "private": true,
-  "description": "Total USD value of Stellar (including Blend pool + backstop) and Solana holdings",
+  "description": "Total USD value of Stellar (including Blend pool + backstop) and Solana holdings, plus a Solana -> Stellar USDC bridge over Circle CCTP",
   "type": "module",
   "bin": {
-    "portfolio": "./portfolio.mjs"
+    "portfolio": "./portfolio.mjs",
+    "bridge": "./bridge.mjs"
   },
   "scripts": {
-    "start": "node portfolio.mjs"
+    "start": "node portfolio.mjs",
+    "bridge": "node bridge.mjs"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
     "@blend-capital/blend-sdk": "3.2.2",
-    "@stellar/stellar-sdk": "14.4.3"
+    "@solana/web3.js": "^1.98.4",
+    "@stellar/stellar-sdk": "14.4.3",
+    "bs58": "^6.0.0"
   }
 }
