@@ -635,6 +635,51 @@ and its price moves on its own afterwards. Its basis is still exact; only the ma
 Value in `invested` means a contract you have not named. The portfolio has no reason to look
 at it, so the report lists the contract addresses to add to `blendPools`.
 
+### An APR per open position
+
+Every open position on the same scale, so a Blend supply, a bond you are holding and a borrow
+can be compared directly:
+
+```
+  positions the lot engine thinks you hold
+    where             asset            amount        basis        value    return    held        APR
+    blend:CDMAVJPF    USTRY        1,388.8377    $1,477.28    $1,489.65    +0.84%    119d     +2.56%
+    blend:CDMAVJPF    CETES       13,132.3588      $833.32      $914.44    +9.73%    244d    +14.54%
+    blend:CDMAVJPF    TESOURO      3,742.7529      $897.94      $900.34    +0.27%      2d        new
+    stellar           BLND          1,733.072       $93.08       $68.00   -26.95%    122d    -80.49%
+    backstop:CDMAVJPF LP share                     $979.44      $901.78    -7.93%    173d    -16.72%
+    blend:CDMAVJPF    USDC             -1,100   -$1,100.00   -$1,100.02    -0.00%      1d        new  borrowed
+```
+
+`held` is the average age of a dollar in the position, not of the position. Each lot keeps the
+date and the cost it had when it went in, so a holding built in three deposits weights each one
+by its size. Annualising the return over that comes out as
+
+```
+APR = gain x 365 / sum(lot basis x lot age in days)
+```
+
+which is dollar-days: every deposit earns for exactly as long as it has actually been in, valued
+at what it cost the day it went in. That is Modified Dietz annualised, algebraically identical to
+it, and it is what makes the rates comparable across positions of different sizes started at
+different times. It is simple annualisation, so it is an APR and not the APY `portfolio.mjs`
+quotes from the pool.
+
+This only works because lots keep their own dates. Moving a holding between your wallet and a
+pool used to close it and open a fresh lot stamped with the transfer, which reset its age every
+time: the CETES above read as 178 days old, exactly the date it moved from one pool to another,
+rather than the 244 days you have actually held it. Transfers now move lots rather than re-date
+them, and income is the one thing that does get today's date, because that is when you acquired
+it.
+
+Under a week it says `new` instead of a rate. A position one day old that moved 3% annualises to
+four figures, which describes the window and not the position. Under a cent of basis it says
+nothing at all, since a percentage of rounding is rounding.
+
+Emissions are their own row, not folded into the position that earned them. That is deliberate:
+the CETES supply and the BLND it pays you are two different bets, and here one is up 14% a year
+while the other is down 80%.
+
 ### The position check
 
 Basis and quantity are different claims, and only the second can be wrong without the

@@ -1105,7 +1105,7 @@ function stellarSwaps(effectsCache) {
  * the two models reconcile: realised + unrealised has to equal the aggregate
  * tookOut + worthToday - putIn, and the caller asserts exactly that.
  */
-function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) {
+function runLots({ entries, currentPrices, marketValue, opaqueLocations = {}, asOf = Date.now() }) {
   const lots = new Map(); // "location:asset" -> [{ at, amount, basisPerUnit }]
   const debts = new Map(); // borrowed positions, same shape, owed rather than held
   const interestUnits = [];
@@ -1120,6 +1120,38 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
     if (!(amount > 0)) return;
     const list = lots.get(key(chain, asset)) ?? [];
     list.push({ at, amount, basisPerUnit: usdValue / amount });
+    lots.set(key(chain, asset), list);
+  };
+
+  /**
+   * Take `amount` FIFO out of a location, keeping each lot's own date and cost.
+   *
+   * Moving a holding between your wallet and a pool used to close it and open a fresh lot
+   * stamped with the transfer, which reset its age every time. A CETES position supplied,
+   * withdrawn and re-supplied three times read as days old however long you had actually
+   * held it, and anything annualised over that is nonsense.
+   */
+  const take = (chain, asset, amount) => {
+    const list = lots.get(key(chain, asset)) ?? [];
+    const taken = [];
+    let left = amount;
+    while (left > 1e-12 && list.length) {
+      const lot = list[0];
+      const use = Math.min(lot.amount, left);
+      taken.push({ at: lot.at, amount: use, basisPerUnit: lot.basisPerUnit });
+      lot.amount -= use;
+      left -= use;
+      if (lot.amount <= 1e-12) list.shift();
+    }
+    lots.set(key(chain, asset), list);
+    return { taken, left, basis: taken.reduce((s, l) => s + l.amount * l.basisPerUnit, 0) };
+  };
+
+  /** Put lots into a location, oldest first so the next FIFO close is still FIFO. */
+  const put = (chain, asset, incoming) => {
+    const list = lots.get(key(chain, asset)) ?? [];
+    for (const l of incoming) if (l.amount > 1e-12) list.push(l);
+    list.sort((a, b) => a.at.localeCompare(b.at));
     lots.set(key(chain, asset), list);
   };
 
@@ -1190,17 +1222,7 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
       const [fromLoc, toLoc] = e.kind === 'blend-supply'
         ? [e.chain, e.pool]
         : [e.pool, e.chain];
-      const list = lots.get(key(fromLoc, e.asset)) ?? [];
-      let left = e.amount;
-      let basis = 0;
-      while (left > 1e-12 && list.length) {
-        const lot = list[0];
-        const take = Math.min(lot.amount, left);
-        basis += take * lot.basisPerUnit;
-        lot.amount -= take;
-        left -= take;
-        if (lot.amount <= 1e-12) list.shift();
-      }
+      const { taken, left, basis } = take(fromLoc, e.asset, e.amount);
       if (left > 1e-9) {
         // Two very different situations look the same here. If the position existed and was
         // merely smaller than the withdrawal, the excess is interest the pool paid, and
@@ -1214,15 +1236,14 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
           interestUnits.push({ asset: e.asset, amount: left, at: e.at });
         } else {
           const price = currentPrices[e.asset];
-          basis += left * (price ?? 0);
+          taken.push({ at: e.at, amount: left, basisPerUnit: price ?? 0 });
           issues.push(
             `${e.asset}: ${e.kind === 'blend-withdraw' ? 'withdrew' : 'supplied'} ${left.toFixed(4)} ` +
             `at ${e.pool} with no position on record (${e.at.slice(0, 10)})`,
           );
         }
       }
-      lots.set(key(fromLoc, e.asset), list);
-      open(toLoc, e.asset, e.at, e.amount, basis);
+      put(toLoc, e.asset, taken);
     } else if (e.kind === 'blend-borrow') {
       // You received an asset and took on a debt of equal value. Nothing is earned yet, so
       // the two must net to zero: an asset lot at market, and a liability at the same value.
@@ -1264,17 +1285,7 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
       // still yours, and value returning from one was already yours.
       const held = e.pool ?? 'invested';
       const [fromLoc, toLoc] = e.kind === 'to-contract' ? [e.chain, held] : [held, e.chain];
-      const list = lots.get(key(fromLoc, e.asset)) ?? [];
-      let left = e.amount;
-      let basis = 0;
-      while (left > 1e-12 && list.length) {
-        const lot = list[0];
-        const take = Math.min(lot.amount, left);
-        basis += take * lot.basisPerUnit;
-        lot.amount -= take;
-        left -= take;
-        if (lot.amount <= 1e-12) list.shift();
-      }
+      const { taken, left } = take(fromLoc, e.asset, e.amount);
       if (left > 1e-9 && e.kind === 'to-contract') {
         issues.push(`${e.asset}: sent ${left.toFixed(4)} to a contract with no basis on record (${e.at.slice(0, 10)})`);
       }
@@ -1293,13 +1304,14 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
           );
         } else {
           const value = left * unit;
-          basis += value;
           earned += value;
+          // Income is acquired now, so it is a new lot dated now, unlike the units that
+          // merely moved and keep the age they already had.
+          taken.push({ at: e.at, amount: left, basisPerUnit: unit });
           earnings.push({ chain: toLoc, asset: e.asset, at: e.at, amount: left, usd: value });
         }
       }
-      lots.set(key(fromLoc, e.asset), list);
-      open(toLoc, e.asset, e.at, e.amount, basis);
+      put(toLoc, e.asset, taken);
     } else if (e.kind === 'adjustment') {
       // Something the chain will not tell this wallet about. A liquidation is the case that
       // forced it: the collateral is seized inside someone else's transaction, so it appears
@@ -1318,22 +1330,13 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
       // Same money, different chain. Carry the basis across rather than realising, except
       // for the part the bridge kept: fewer units arrive than left, and those units are
       // gone for good, so their basis is a realised loss rather than something to carry.
-      const list = lots.get(key(e.fromChain, e.asset)) ?? [];
-      let left = e.amount;
-      let basis = 0;
-      while (left > 1e-12 && list.length) {
-        const lot = list[0];
-        const take = Math.min(lot.amount, left);
-        basis += take * lot.basisPerUnit;
-        lot.amount -= take;
-        left -= take;
-        if (lot.amount <= 1e-12) list.shift();
-      }
-      if (left > 1e-9) basis += left * (e.usd / e.amount);
-      lots.set(key(e.fromChain, e.asset), list);
+      const { taken, left } = take(e.fromChain, e.asset, e.amount);
+      if (left > 1e-9) taken.push({ at: e.at, amount: left, basisPerUnit: e.usd / e.amount });
       const received = e.received ?? e.amount;
-      const carried = basis * (received / e.amount);
-      const fee = basis - carried;
+      // The bridge keeps a slice of every lot, so each one arrives proportionally smaller
+      // and its date and cost per unit travel with it.
+      const kept = received / e.amount;
+      const fee = taken.reduce((sum, l) => sum + l.amount * (1 - kept) * l.basisPerUnit, 0);
       if (fee > 1e-9) {
         realised -= fee;
         disposals.push({
@@ -1341,7 +1344,7 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
           proceeds: 0, basis: fee, gain: -fee, label: 'bridge fee',
         });
       }
-      open(e.toChain, e.asset, e.at, received, carried);
+      put(e.toChain, e.asset, taken.map((l) => ({ ...l, amount: l.amount * kept })));
     }
     if (auditing) {
       const leak = netBasisNow() - (realised + earned + contributed);
@@ -1356,6 +1359,36 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
   }
 
   if (auditing) console.error(`  basis leak, total ${(netBasisNow() - realised - earned - contributed).toFixed(4)}`);
+  // How long the money in a position has actually been there, weighted by how much of it
+  // each tranche is. A position built in three deposits is not as old as its first and not
+  // as young as its last, and annualising against either is wrong by however far apart they
+  // are. Each lot keeps the date and the cost it had when it went in, so this is the average
+  // dollar's age, not the position's.
+  const heldDays = (list) => {
+    const weight = list.reduce((sum, l) => sum + l.amount * l.basisPerUnit, 0);
+    if (!(weight > 0)) return undefined;
+    const weighted = list.reduce(
+      (sum, l) => sum + l.amount * l.basisPerUnit * ((asOf - Date.parse(l.at)) / 86400000),
+      0,
+    );
+    return weighted / weight;
+  };
+  // Simple annualisation, so this is an APR and not an APY.
+  //
+  // Together with the weighted age above this reduces to gain x 365 / sum(basis x days),
+  // which is dollar-days: every deposit earns for exactly as long as it has been in, valued
+  // at what it cost the day it went in. That is Modified Dietz annualised, algebraically
+  // identical, and it is why these rates are comparable across positions of different sizes
+  // built at different times.
+  //
+  // Under a week it is suppressed. A position one day old that moved 3% annualises to four
+  // figures, which says nothing about the position and everything about the window.
+  const apr = (basis, value, days) => {
+    // A cent of basis divided into a cent of gain is not a rate, it is rounding.
+    if (!(basis >= 0.01) || value === undefined || days === undefined || days < 7) return undefined;
+    return ((value - basis) / basis) * (365 / days);
+  };
+
   let markedValue = 0;
   let openBasis = 0;
   const holdings = [];
@@ -1372,19 +1405,20 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
     // A location whose contents were exchanged for something the replay never sees cannot
     // be marked by pricing what went in. Its basis is still exact, so it counts here; only
     // the mark comes from elsewhere, and it is added once per location below.
+    const days = heldDays(list);
     if (opaqueLocations[chain] !== undefined) {
-      holdings.push({ chain, asset, amount, basis, value: undefined, opaque: true });
+      holdings.push({ chain, asset, amount, basis, days, value: undefined, opaque: true });
       continue;
     }
     const price = currentPrices[asset];
     if (price === undefined) {
       issues.push(`${asset} on ${chain}: holding ${amount.toFixed(6)} with no current price, its own mark is missing`);
-      holdings.push({ chain, asset, amount, basis, value: undefined, gain: undefined });
+      holdings.push({ chain, asset, amount, basis, days, value: undefined, gain: undefined });
       continue;
     }
     const value = amount * price;
     markedValue += value;
-    holdings.push({ chain, asset, amount, basis, value, gain: value - basis });
+    holdings.push({ chain, asset, amount, basis, days, value, gain: value - basis, apr: apr(basis, value, days) });
   }
 
   // Debt still outstanding is negative value. Marked at today's price so a debt that grew
@@ -1392,8 +1426,13 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
   const locationMarks = [];
   for (const [location, mark] of Object.entries(opaqueLocations)) {
     markedValue += mark;
-    const basis = holdings.filter((h) => h.chain === location).reduce((sum, h) => sum + h.basis, 0);
-    locationMarks.push({ location, basis, value: mark });
+    const inside = holdings.filter((h) => h.chain === location);
+    const basis = inside.reduce((sum, h) => sum + h.basis, 0);
+    const weight = inside.reduce((sum, h) => sum + (h.days === undefined ? 0 : h.basis), 0);
+    const days = weight > 0
+      ? inside.reduce((sum, h) => sum + (h.days ?? 0) * h.basis, 0) / weight
+      : undefined;
+    locationMarks.push({ location, basis, days, value: mark, apr: apr(basis, mark, days) });
   }
 
   const outstanding = [];
@@ -1405,8 +1444,15 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
     const basis = list.reduce((s, d) => s + d.amount * d.basisPerUnit, 0);
     debtBasis += basis;
     const price = currentPrices[asset];
-    outstanding.push({ location, asset, amount, basis, value: price === undefined ? undefined : amount * price });
-    if (price !== undefined) markedValue -= amount * price;
+    const value = price === undefined ? undefined : amount * price;
+    const days = heldDays(list);
+    // A debt returns the mirror image: owing more than you borrowed is the cost of carrying
+    // it, so the sign is flipped and this reads as the rate the borrow is charging you.
+    outstanding.push({
+      location, asset, amount, basis, value, days,
+      apr: value === undefined ? undefined : apr(basis, 2 * basis - value, days),
+    });
+    if (price !== undefined) markedValue -= value;
   }
 
   // Unrealised is what today's value exceeds the basis still open, and today's value is the
@@ -2178,23 +2224,41 @@ async function main() {
     if (result.holdings.length) {
       console.log('');
       console.log('  positions the lot engine thinks you hold');
-      for (const h of [...result.holdings].sort((a, b) => (b.value ?? 0) - (a.value ?? 0))) {
-        const mark = h.opaque ? 'in an LP share' : h.value === undefined ? 'unpriced' : usd(h.value);
+      const qty = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 4 });
+      // Every open position on the same scale, so a Blend supply and a token you are simply
+      // holding can be compared. The return is against basis, and basis is what the position
+      // actually cost, which for emissions is what they were worth when they landed rather
+      // than nothing. APR is that return annualised over how long the money has been in it.
+      const row = (where, asset, amount, basis, mark, days, rate, note) => {
+        // Under a cent of basis, a percentage is two rounding errors divided by each other.
+        const ret = typeof mark === 'number' && Math.abs(basis) >= 0.01
+          ? (mark - basis) / Math.abs(basis)
+          : undefined;
         console.log(
-          `    ${h.chain.padEnd(16)} ${h.asset.padEnd(8)} ${h.amount.toLocaleString('en-US', { maximumFractionDigits: 4 }).padStart(14)}` +
-          `  basis ${usd(h.basis).padStart(11)}  value ${mark.padStart(13)}`,
+          `    ${where.padEnd(17)} ${asset.padEnd(9)} ${amount.padStart(13)}` +
+          `  ${usd(basis).padStart(11)}  ${(typeof mark === 'number' ? usd(mark) : mark).padStart(11)}` +
+          `  ${(ret === undefined ? '' : pct(ret * 100)).padStart(8)}` +
+          `  ${(days === undefined ? '' : `${Math.round(days)}d`).padStart(6)}` +
+          `  ${(rate === undefined ? (days !== undefined && days < 7 ? 'new' : '') : pct(rate * 100)).padStart(9)}` +
+          (note ? `  ${note}` : ''),
         );
+      };
+      console.log(
+        `    ${'where'.padEnd(17)} ${'asset'.padEnd(9)} ${'amount'.padStart(13)}` +
+        `  ${'basis'.padStart(11)}  ${'value'.padStart(11)}  ${'return'.padStart(8)}` +
+        `  ${'held'.padStart(6)}  ${'APR'.padStart(9)}`,
+      );
+      for (const h of [...result.holdings].sort((a, b) => (b.value ?? b.basis ?? 0) - (a.value ?? a.basis ?? 0))) {
+        if (h.opaque) continue; // shown as its location below, since its parts cannot be marked
+        row(h.chain, h.asset, qty(h.amount), h.basis, h.value === undefined ? 'unpriced' : h.value, h.days, h.apr);
       }
       // The locations whose contents were swapped for something the wallet never sees. One
       // line each, because their constituents cannot be marked but the position can.
       for (const m of result.locationMarks ?? []) {
-        console.log(
-          `    ${m.location.padEnd(16)} ${'LP share'.padEnd(8)} ${''.padStart(14)}` +
-          `  basis ${usd(m.basis).padStart(11)}  value ${usd(m.value).padStart(13)}`,
-        );
+        row(m.location, 'LP share', '', m.basis, m.value, m.days, m.apr);
       }
       for (const d of result.outstanding ?? []) {
-        console.log(`    ${d.location.padEnd(16)} ${d.asset.padEnd(8)} ${(-d.amount).toLocaleString('en-US', { maximumFractionDigits: 4 }).padStart(14)}  owed`);
+        row(d.location, d.asset, qty(-d.amount), -d.basis, d.value === undefined ? 'owed' : -d.value, d.days, d.apr, 'borrowed');
       }
     }
 
