@@ -6,11 +6,13 @@
   "type": "module",
   "bin": {
     "portfolio": "./portfolio.mjs",
-    "bridge": "./bridge.mjs"
+    "bridge": "./bridge.mjs",
+    "ledger": "./ledger.mjs"
   },
   "scripts": {
     "start": "node portfolio.mjs",
-    "bridge": "node bridge.mjs"
+    "bridge": "node bridge.mjs",
+    "ledger": "node ledger.mjs"
   },
   "engines": {
     "node": ">=18"

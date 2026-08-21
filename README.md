@@ -396,3 +396,82 @@ published Stellar `TokenMessengerMinter`, which pins the whole route down.
 
 Mainnet only, deliberately. Testnet would mean shipping a second set of addresses that this
 script has never exercised.
+
+## What have I actually gained
+
+`portfolio.mjs` says what the wallets are worth. `ledger.mjs` says how much of that you put
+in yourself:
+
+```bash
+node ledger.mjs --refresh   # fetch new history, then report
+node ledger.mjs             # report from cache
+node ledger.mjs --flows     # list every external flow
+```
+
+```
+put in                  $3,967.85   20 transfers in
+taken out                 $132.93   8 transfers out
+worth today             $4,282.07
+
+gain                      $447.15   +11.27%
+your money still in     $3,834.92   put in, less what you took back out
+
+  by chain              put in    taken out   worth today    gain/loss   return
+  stellar            $3,876.58        $1.64     $4,276.74      $401.80   +10.36%
+  solana               $448.93      $488.95         $5.33       $45.35   +10.10%
+```
+
+A leg is judged on what it gave back plus what it still holds, against everything ever put
+into it: `gain = takenOut + worthToday - putIn`. Money bridged between the wallets counts as
+taken out of the sending chain and put into the receiving one, which is what makes the two rows
+add back to the total. Percentages are always signed, so a losing leg reads as one.
+
+### How it decides what counts
+
+Only money crossing the boundary of your wallets counts. Swaps, Blend supply and withdraw,
+borrows and repayments all move balances around without changing what you are worth, so they
+are ignored. Concretely:
+
+- **Stellar**: external flows are plain `payment` and `create_account` ops with a counterparty
+  that is not you. Path payments are self-to-self swaps. Soroban invocations are Blend or the
+  bridge, and Horizon reports them with no amount at all, which is a fair hint they are not
+  payments in the ordinary sense.
+- **Solana**: inferred from per-transaction balance deltas, since the data carries no
+  payment/swap distinction. One asset down and another up in the same transaction is a swap.
+  The fee is added back first, and sub-0.03 SOL moves are treated as rent noise, so closing a
+  token account does not read as a withdrawal.
+- **Between your own wallets**: an outflow on one chain that reappears on the other within six
+  hours, same asset, within 2%, is the same money moving. Those pairs cancel instead of counting
+  as a withdrawal plus a fresh deposit. This is what catches the CCTP bridge.
+
+Stellar bridge arrivals are found through `/effects` rather than `/payments`, because a Soroban
+`mint_and_forward` produces an `account_credited` effect but a payment record with no amount.
+Effects are used only for this matching, never to classify external flows, since they also fire
+for every swap leg.
+
+### Valuation and its limits
+
+Flows are valued on the day they happened, from whichever source knows that asset best:
+
+| asset | source |
+| --- | --- |
+| USDC, USDT, EURC | par |
+| CETES, TESOURO, USTRY and the other Etherfuse bonds | `GET /lookup/bonds/history/{mint}`, exact daily `tokenPrice / usdExchangeRate` |
+| MXNe | pegged 1:1 to the peso, so the ECB USD/MXN fixing for that day |
+| XLM, SOL | CoinGecko daily history |
+
+Mints come from `GET /lookup/tokens/cost`, and the bond series arrives whole in one unpaginated
+response, so each is fetched once and cached. Everything lands in `.ledger/` because a past day's
+price never changes. Anything still unpriced is counted as **$0** and listed explicitly rather
+than guessed at, the same policy `portfolio.mjs` uses.
+
+Two things this number is not:
+
+- **It is not a time-weighted return.** Deposits landed on different dates, so 11.65% is total
+  gain over contributions, not an annualized rate. Money that arrived in March has not been
+  working as long as money from November.
+- **It assumes every external counterparty is a third party.** A transfer to another wallet you
+  own that is not in `wallets.json` reads as a withdrawal. Add every wallet you control.
+
+History is cached under `.ledger/` (gitignored). Both chains are append-only, so a refresh only
+fetches what is new; the first run walks everything and takes a few minutes on public endpoints.

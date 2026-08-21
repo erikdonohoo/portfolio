@@ -3,3 +3,4 @@ node_modules/
 *.key
 .bridge/
 wallets.json
+.ledger/
