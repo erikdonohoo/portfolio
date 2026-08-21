@@ -29,6 +29,9 @@ const SOLANA_RPC = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solan
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const warnings = [];
+const warn = (msg) => warnings.push(msg);
+
 // Stellar is full of zero and near-zero spam payments; ignore anything below this.
 const DUST = 0.001;
 
@@ -280,15 +283,23 @@ const FIAT_PEGGED = { MXNE: 'MXN', MXNe: 'MXN' };
 
 const ETHERFUSE_API = process.env.ETHERFUSE_API_URL ?? 'https://api.etherfuse.com';
 
+// Symbols whose series has already been pulled fresh this run.
+const refetched = new Set();
+
+// The free CoinGecko tier rejects bursts, and these lookups are permanently cacheable, so
+// a slow first run is a better trade than a silently unpriced flow.
+const COINGECKO_SPACING_MS = Number(process.env.COINGECKO_SPACING_MS ?? 6000);
+let lastCoingecko = 0;
+
 /**
  * Etherfuse publishes a full daily series per bond, so its tokens can be priced exactly on
  * the day rather than approximated. tokenPrice is in the bond's own currency and
  * usdExchangeRate converts it, which is the same arithmetic the pool oracle does.
  * The whole series arrives in one unpaginated response, so it is fetched once and cached.
  */
-async function etherfuseSeries(symbol) {
+async function etherfuseSeries(symbol, { force = false } = {}) {
   const cached = loadCache(`etherfuse-${symbol}`, undefined);
-  if (cached) return cached;
+  if (cached && !force) return cached;
 
   const mints = loadCache('etherfuse-mints', undefined) ?? (await refreshEtherfuseMints());
   const mint = mints[symbol];
@@ -319,14 +330,94 @@ async function refreshEtherfuseMints() {
   return mints;
 }
 
-/** Last observation on or before the date, so a gap in the series carries forward. */
+// A weekend or holiday gap is normal and carrying the last price forward is right. A gap
+// wider than this means the series ends before the date being asked about, which is a
+// cache that predates the flow rather than a real gap.
+const SERIES_STALE_DAYS = 3;
+
+/**
+ * Last observation on or before the date, with how stale that observation is. Reports the
+ * gap rather than deciding what to do about it, because the fix for a stale series is to
+ * refetch it, and only the caller knows whether that has already been tried.
+ */
 function seriesPriceOn(series, isoDate) {
   let best;
   for (const point of series) {
     if (point.date > isoDate) break;
     best = point;
   }
-  return best?.usd;
+  if (!best) return { usd: undefined, staleDays: Infinity };
+  return {
+    usd: best.usd,
+    staleDays: (Date.parse(isoDate) - Date.parse(best.date)) / 86400000,
+    endsAt: best.date,
+  };
+}
+
+const USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+/**
+ * Historical price straight off the SDEX, via Horizon's trade aggregations. This is the
+ * venue a Stellar balance can actually be sold on, it has no rate limit, and it can be
+ * asked for the hour a transfer happened rather than a whole day's average. Falls back to
+ * the day when that hour had no trades, and returns undefined when the pair never traded.
+ */
+async function sdexPriceAt(asset, issuer, at) {
+  const base = issuer
+    ? `base_asset_type=credit_alphanum${asset.length > 4 ? 12 : 4}&base_asset_code=${asset}&base_asset_issuer=${issuer}`
+    : 'base_asset_type=native';
+  const counter =
+    `counter_asset_type=credit_alphanum4&counter_asset_code=USDC&counter_asset_issuer=${USDC_ISSUER}`;
+
+  const ms = Date.parse(at);
+  for (const resolution of [3600000, 86400000]) {
+    const start = Math.floor(ms / resolution) * resolution;
+    const url =
+      `${HORIZON}/trade_aggregations?${base}&${counter}` +
+      `&resolution=${resolution}&start_time=${start}&end_time=${start + resolution}&order=asc&limit=1`;
+    try {
+      const body = await getJson(url);
+      const record = body._embedded?.records?.[0];
+      // avg is volume weighted across the bucket, which is the fairest single number for
+      // a transfer that happened somewhere inside it.
+      const avg = Number(record?.avg);
+      if (Number.isFinite(avg) && avg > 0) return avg;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+// Coinbase's public candles need no key and go back years, unlike CoinGecko's free tier
+// which refuses anything older than 365 days. That cap is why every 2024 flow priced at $0.
+const COINBASE_PRODUCT = { SOL: 'SOL-USD', XLM: 'XLM-USD', BTC: 'BTC-USD', ETH: 'ETH-USD' };
+
+async function coinbasePriceAt(symbol, at) {
+  const product = COINBASE_PRODUCT[symbol];
+  if (!product) return undefined;
+  const ms = Date.parse(at);
+  for (const granularity of [3600, 86400]) {
+    const span = granularity * 1000;
+    const start = Math.floor(ms / span) * span;
+    const url =
+      `https://api.exchange.coinbase.com/products/${product}/candles` +
+      `?start=${new Date(start).toISOString()}&end=${new Date(start + span).toISOString()}` +
+      `&granularity=${granularity}`;
+    try {
+      const rows = await getJson(url);
+      // [time, low, high, open, close, volume]. Typical price is the closest single-number
+      // analogue to the volume-weighted average used for the SDEX.
+      const row = rows?.[0];
+      if (row) {
+        const typical = (Number(row[1]) + Number(row[2]) + Number(row[4])) / 3;
+        if (Number.isFinite(typical) && typical > 0) return typical;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 async function fiatPriceOn(currency, isoDate) {
@@ -340,9 +431,12 @@ async function fiatPriceOn(currency, isoDate) {
  * needs a historical quote, cached forever because a past day's price never changes.
  * Returns undefined rather than guessing, so unpriced flows can be reported as such.
  */
-async function priceOn(symbol, isoDate) {
+async function priceOn(symbol, at, issuer) {
   if (STABLES.has(symbol)) return 1;
-  const key = `${symbol}:${isoDate}`;
+  const isoDate = at.slice(0, 10);
+  // Keyed to the hour, because the SDEX lookup is hourly and a price at 02:00 is not the
+  // same as one at 20:00 on a volatile day.
+  const key = `${symbol}:${at.slice(0, 13)}`;
   const cache = loadCache('prices', {});
   if (key in cache && cache[key] !== null) return cache[key];
 
@@ -352,15 +446,30 @@ async function priceOn(symbol, isoDate) {
     return usd;
   };
 
-  // Etherfuse bonds carry an exact daily price, so prefer it over anything else.
+  // Etherfuse bonds carry an exact daily price, so prefer it over anything else. The
+  // endpoint returns the whole series unpaginated, so a date the cache does not reach is
+  // just a cache written before that date existed: refetch rather than give up. Once per
+  // symbol per run, since one refetch brings the series current for every date.
   try {
-    const series = await etherfuseSeries(symbol);
+    let series = await etherfuseSeries(symbol);
     if (series?.length) {
-      const usd = seriesPriceOn(series, isoDate);
-      if (usd !== undefined) return remember(usd);
+      let hit = seriesPriceOn(series, isoDate);
+      if (hit.staleDays > SERIES_STALE_DAYS && !refetched.has(symbol)) {
+        refetched.add(symbol);
+        series = await etherfuseSeries(symbol, { force: true });
+        hit = seriesPriceOn(series, isoDate);
+      }
+      if (hit.usd !== undefined && hit.staleDays <= SERIES_STALE_DAYS) return remember(hit.usd);
+      if (hit.usd !== undefined) {
+        // Still short after a fresh pull, so the API genuinely has nothing nearer.
+        warn(
+          `${symbol} history reaches ${hit.endsAt} but ${isoDate} was needed ` +
+          `(${Math.round(hit.staleDays)} days), so that flow is unpriced`,
+        );
+      }
     }
-  } catch {
-    // fall through to the other sources
+  } catch (e) {
+    warn(`${symbol} history lookup failed: ${e.message}`);
   }
 
   const pegged = FIAT_PEGGED[symbol] ?? FIAT_PEGGED[symbol.toUpperCase()];
@@ -372,15 +481,33 @@ async function priceOn(symbol, isoDate) {
     }
   }
 
+  // The SDEX is where a Stellar-held asset actually trades, so prefer it over an
+  // off-network aggregate, and it has no rate limit to run into.
+  if (issuer || symbol === 'XLM') {
+    const sdex = await sdexPriceAt(symbol, issuer, at);
+    if (sdex !== undefined) return remember(sdex);
+  }
+
+  const coinbase = await coinbasePriceAt(symbol, at);
+  if (coinbase !== undefined) return remember(coinbase);
+
   const id = COINGECKO_ID[symbol];
   if (!id) return remember(undefined);
   const [y, m, d] = isoDate.split('-');
+  const since = Date.now() - lastCoingecko;
+  if (since < COINGECKO_SPACING_MS) await sleep(COINGECKO_SPACING_MS - since);
+  lastCoingecko = Date.now();
   try {
     const body = await getJson(
       `https://api.coingecko.com/api/v3/coins/${id}/history?date=${d}-${m}-${y}&localization=false`,
     );
-    return remember(body?.market_data?.current_price?.usd);
-  } catch {
+    const usd = body?.market_data?.current_price?.usd;
+    if (usd === undefined) warn(`coingecko has no ${symbol} price for ${isoDate}`);
+    return remember(usd);
+  } catch (e) {
+    // A fetch failure and a genuinely unknown price are different things, and treating
+    // them the same is how a rate limit turns into a silently wrong total.
+    warn(`coingecko lookup failed for ${symbol} on ${isoDate}: ${e.message}`);
     return undefined;
   }
 }
@@ -402,7 +529,7 @@ function stellarFlows(cache) {
     if (!Number.isFinite(amount) || amount < DUST) continue;
 
     if (r.type === 'create_account' && r.to === account) {
-      flows.push({ chain: 'stellar', at: r.at, dir: 'in', asset: r.asset ?? 'XLM', amount, other: r.from, tx: r.tx });
+      flows.push({ chain: 'stellar', at: r.at, dir: 'in', asset: r.asset ?? 'XLM', issuer: r.issuer, amount, other: r.from, tx: r.tx });
       continue;
     }
     if (r.type !== 'payment') continue;
@@ -413,6 +540,7 @@ function stellarFlows(cache) {
       at: r.at,
       dir: r.to === account ? 'in' : 'out',
       asset: r.asset ?? 'XLM',
+      issuer: r.issuer,
       amount,
       other,
       tx: r.tx,
@@ -536,16 +664,44 @@ async function main() {
     return 0;
   }
   const config = JSON.parse(readFileSync(join(HERE, 'wallets.json'), 'utf8'));
-  const log = (msg) => process.stderr.write(`\r${msg.padEnd(70)}`);
+  // Progress uses carriage returns to overwrite in place, which is only meaningful on a
+  // terminal. Piped or redirected, it would just be noise in the captured output.
+  const log = (msg) => {
+    if (process.stderr.isTTY) process.stderr.write(`\r${msg.padEnd(70)}`);
+  };
 
   if (args.includes('--refresh')) {
+    const fetched = [];
     for (const account of config.stellar ?? []) {
-      await refreshStellar(account, log);
-      await refreshStellarEffects(account, log);
+      fetched.push(await refreshStellar(account, log));
+      fetched.push(await refreshStellarEffects(account, log));
     }
-    for (const owner of config.solana ?? []) await refreshSolana(owner, log);
-    await refreshMints(config.solana ?? [], log);
-    process.stderr.write('\n');
+    for (const owner of config.solana ?? []) fetched.push(await refreshSolana(owner, log));
+    fetched.push(await refreshMints(config.solana ?? [], log));
+
+    // Bond series are append-only too, but the endpoint has no cursor: it returns the
+    // whole thing. So a refresh pulls it again rather than trusting a cache that would
+    // otherwise silently stop at the day it was first written.
+    const mints = await refreshEtherfuseMints();
+    for (const symbol of Object.keys(mints)) {
+      if (!existsSync(cachePath(`etherfuse-${symbol}`))) continue;
+      const before = loadCache(`etherfuse-${symbol}`, [])?.length ?? 0;
+      const series = await etherfuseSeries(symbol, { force: true });
+      fetched.push({
+        account: `etherfuse ${symbol}`,
+        total: series?.length ?? 0,
+        added: Math.max(0, (series?.length ?? 0) - before),
+      });
+      log(`etherfuse ${symbol}: ${series?.length ?? 0} points`);
+    }
+
+    if (process.stderr.isTTY) process.stderr.write(`\r${' '.repeat(72)}\r`);
+    console.log('cache');
+    for (const f of fetched) {
+      const added = f.added > 0 ? `  +${f.added} new` : '  up to date';
+      console.log(`  ${(f.account ?? f.owner).padEnd(46)} ${String(f.total).padStart(5)}${added}`);
+    }
+    console.log('');
   }
 
   // Gather every flow that crosses the boundary of the wallets we track.
@@ -578,7 +734,7 @@ async function main() {
   // Value each one on the day it happened.
   const unpriced = [];
   for (const f of external) {
-    const price = await priceOn(f.asset, f.at.slice(0, 10));
+    const price = await priceOn(f.asset, f.at, f.issuer);
     if (price === undefined) {
       unpriced.push(f);
       f.usd = 0;
@@ -605,7 +761,7 @@ async function main() {
   // side and a real withdrawal from the sending side. They cancel in the total, which is
   // what makes the two halves add back up to it.
   for (const pair of pairs) {
-    const price = await priceOn(pair.out.asset, pair.out.at.slice(0, 10));
+    const price = await priceOn(pair.out.asset, pair.out.at, pair.out.issuer);
     pair.usd = (price ?? 0) * pair.out.amount;
   }
   const perChain = {};
@@ -689,9 +845,11 @@ async function main() {
       'worth today'.padStart(14) + 'gain/loss'.padStart(13) + '   return',
     );
     for (const [chain, c] of Object.entries(perChain)) {
+      const suspect = unpriced.filter((f) => f.chain === chain);
+      const flag = suspect.length ? `  <- ${suspect.length} unpriced flow(s), see below` : '';
       console.log(
         `  ${chain.padEnd(15)}${usd(c.putInUsd).padStart(13)}${usd(c.tookOutUsd).padStart(13)}` +
-        `${usd(c.currentUsd).padStart(14)}${usd(c.gainUsd).padStart(13)}   ${pct(c.returnPct)}`,
+        `${usd(c.currentUsd).padStart(14)}${usd(c.gainUsd).padStart(13)}   ${pct(c.returnPct)}${flag}`,
       );
     }
     const bridged = pairs.reduce((s, p) => s + p.usd, 0);
@@ -703,9 +861,30 @@ async function main() {
   }
 
   if (unpriced.length) {
+    const inCount = unpriced.filter((f) => f.dir === 'in').length;
+    const outCount = unpriced.length - inCount;
     console.log('');
     console.log(`no historical price for ${unpriced.length} flow(s), counted as $0:`);
-    for (const f of unpriced) console.log(`  ${f.at.slice(0, 10)}  ${f.amount} ${f.asset} (${f.chain})`);
+    for (const f of unpriced) {
+      console.log(`  ${f.at.slice(0, 10)}  ${f.dir === 'in' ? 'IN ' : 'OUT'}  ${f.amount} ${f.asset} (${f.chain})`);
+    }
+    console.log('');
+    // Direction matters more than count. Value that entered at $0 and left at full price is
+    // pure fabricated profit, and the size of the lie is exactly the missing valuation.
+    console.log('  *** the gain above is not reliable ***');
+    if (inCount) {
+      console.log(`  ${inCount} inflow(s) counted as $0. Real money that entered as nothing and left as`);
+      console.log('  something shows up as profit that was never earned, so the gain is OVERSTATED.');
+    }
+    if (outCount) {
+      console.log(`  ${outCount} outflow(s) counted as $0, which pushes the gain the other way, DOWN.`);
+    }
+    console.log('  Price these flows, or exclude the assets, before trusting the percentage.');
+  }
+  if (warnings.length) {
+    console.log('');
+    console.log('Warnings:');
+    for (const w of [...new Set(warnings)]) console.log(`  ${w}`);
   }
   return 0;
 }

@@ -464,17 +464,47 @@ for every swap leg.
 
 Flows are valued on the day they happened, from whichever source knows that asset best:
 
-| asset | source |
-| --- | --- |
-| USDC, USDT, EURC | par |
-| CETES, TESOURO, USTRY and the other Etherfuse bonds | `GET /lookup/bonds/history/{mint}`, exact daily `tokenPrice / usdExchangeRate` |
-| MXNe | pegged 1:1 to the peso, so the ECB USD/MXN fixing for that day |
-| XLM, SOL | CoinGecko daily history |
+| asset | source | precision |
+| --- | --- | --- |
+| USDC, USDT, EURC | par | n/a |
+| CETES, TESOURO, USTRY and the other Etherfuse bonds | `GET /lookup/bonds/history/{mint}`, `tokenPrice / usdExchangeRate` | daily |
+| MXNe | pegged 1:1 to the peso, so the ECB USD/MXN fixing | daily |
+| XLM and any classic Stellar asset | Horizon `/trade_aggregations` against USDC, volume weighted | **hourly** |
+| SOL, BTC, ETH | Coinbase public candles | **hourly** |
+| anything else with a CoinGecko id | CoinGecko history, last 365 days only | daily |
 
-Mints come from `GET /lookup/tokens/cost`, and the bond series arrives whole in one unpaginated
-response, so each is fetched once and cached. Everything lands in `.ledger/` because a past day's
+Stellar assets are priced off the SDEX rather than an off-network aggregate, for the same
+reason `portfolio.mjs` is: that is the venue the balance can actually be sold on. It also
+has no rate limit and can be asked for the specific hour a transfer landed, which matters on
+a volatile day. The 2025-11-21 XLM deposit prices at 0.2384205, the volume-weighted average
+of the 887 trades in that hour, against CoinGecko's 0.236809 for the day as a whole.
+
+Mints come from `GET /lookup/tokens/cost`. Everything lands in `.ledger/` because a past day's
 price never changes. Anything still unpriced is counted as **$0** and listed explicitly rather
 than guessed at, the same policy `portfolio.mjs` uses.
+
+The bond series is the one cache with no cursor: that endpoint returns the whole series every
+time. So when a flow needs a date the cached series does not reach, it refetches once per symbol
+rather than carrying the last known price forward, which would silently understate anything
+accrued since. A price is only reported as unavailable if a fresh pull still does not cover the
+date. A fetch failure and a genuinely unknown price are also reported differently, because
+treating them the same is how a rate limit becomes a quietly wrong total.
+
+### Why an unpriced flow is not a rounding error
+
+A flow counted as $0 does not just lose a little precision, it corrupts the answer in a known
+direction. `gain = tookOut + worthToday - putIn`, so **an inflow valued at $0 inflates the gain
+one for one**: real money entered as nothing, left as something, and the difference is reported
+as profit that was never earned. An unpriced outflow pushes the other way.
+
+This is not hypothetical. CoinGecko's free tier refuses anything older than 365 days
+(`error_code 10012`), so every 2024 flow priced at $0 and one wallet reported a **+301%** Solana
+return that was mostly a handful of unpriced SOL deposits. Coinbase's candles need no key and go
+back years, which is why they now come first for the assets they cover.
+
+For anything still unpriced the report says so, splits the count by direction, and states which
+way the number is wrong rather than printing a confident percentage. Memecoins with no listing
+anywhere will always land here.
 
 Two things this number is not:
 
@@ -485,7 +515,10 @@ Two things this number is not:
   own that is not in `wallets.json` reads as a withdrawal. Add every wallet you control.
 
 History is cached under `.ledger/` (gitignored). Both chains are append-only, so a refresh only
-fetches what is new; the first run walks everything and takes a few minutes on public endpoints.
+fetches what is new: Stellar resumes from the stored Horizon cursor, Solana stops walking
+signatures once it reaches the newest one already cached, and mints only resolve symbols not seen
+before. `--refresh` prints what each source holds and how much of it is new. The first run walks
+everything and takes a few minutes on public endpoints.
 
 ## Watching a price, and getting out
 
