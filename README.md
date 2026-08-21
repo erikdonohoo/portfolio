@@ -107,7 +107,10 @@ when the simulation cannot run; the source column says `blend-sdk-estimate` when
 ## What it counts
 
 **Stellar** (Horizon): XLM, every trustline balance, liquidity pool shares broken down into
-their underlying reserves, and claimable balances.
+their underlying reserves, and claimable balances. A balance with XLM or tokens committed to a
+DEX offer is labelled `(N in offers)`. Horizon's balance already includes that amount, so the
+total is right either way, but a balance that is mostly spoken for reads very differently from a
+free one.
 
 **Blend** (Soroban, via `@blend-capital/blend-sdk`): supplied and collateral positions,
 **minus anything you have borrowed**, so a pool line is your net position. Plus your backstop
@@ -131,6 +134,14 @@ first one that answers wins:
 
 Soroban tokens are resolved to their underlying classic asset via the token contract's
 metadata, so a Stellar Asset Contract prices the same way its classic asset does.
+
+Note that source 2 and source 3 can disagree meaningfully, because they measure different
+things. stellar.expert aggregates across venues, including the exchanges where most XLM
+actually trades; a Horizon path quote is the price on the SDEX order book, which is the only
+place a Stellar-held balance can actually be sold. In August 2026 those differed by 1.8% on
+XLM, with SDEX at a premium. Neither is wrong. If you care what a position would fetch on
+Stellar today, the path quote is the relevant one; if you care what the asset is worth in the
+wider market, stellar.expert is.
 
 **Solana**
 1. Jupiter (`tokens/v2/search`), which returns symbol, decimals and USD price together.
@@ -475,3 +486,68 @@ Two things this number is not:
 
 History is cached under `.ledger/` (gitignored). Both chains are append-only, so a refresh only
 fetches what is new; the first run walks everything and takes a few minutes on public endpoints.
+
+## Watching a price, and getting out
+
+Two small tools for a directional position on the SDEX. They are separate on purpose: one
+only looks, the other only acts, and neither does both.
+
+### watch.mjs
+
+```bash
+node watch.mjs --pair XLM/USDC --below 0.18 --size 535 --every 60
+```
+
+Polls the order book and alerts to the terminal, the bell, and a macOS notification when the
+price crosses. It reads only: it places no offers and moves no funds.
+
+`--size` is the flag worth understanding. Without it the check uses the top of the book, which
+can be a rounding error of volume: this pair's best bid was 0.39 XLM deep at one point and 520
+XLM deep an hour later. Passing your position size prices the fill you could actually get, so a
+thin top level cannot trigger a false alarm. That matters most during a fast move, which is
+exactly when a thin top level is likeliest.
+
+Add `--exit` and it acts on the alert instead of just reporting it: cancels the resting offers
+on that pair and sells, by shelling out to `exit.mjs` so there is exactly one code path that
+moves funds and it is the same one you can preview by hand. The command it runs is printed
+before it runs. It prints a loud `*** ARMED TO SELL ***` banner at startup, and it stops after a
+successful exit because there is nothing left to watch.
+
+A failed exit is the case it shouts loudest about. The trigger fired, the sale did not land, and
+you are still holding: it says so, notifies separately, and stays up to retry on the next
+crossing rather than exiting quietly and leaving you to assume you are out.
+
+Three things it treats as first-class rather than afterthoughts:
+
+- **Rearming.** After an alert it stays quiet until the price recovers past a band (`--rearm`,
+  default 0.5%), so a price resting on the threshold does not alert every minute.
+- **Going blind.** Five failed polls in a row raises its own alert, because a watcher that has
+  lost its connection looks exactly like a calm market.
+- **The floor on an automated exit.** `--exit-min-price` defaults to 20% under the threshold
+  rather than to no floor at all. On a book with 157,000 XLM of bids inside 20% of the top, a
+  floor that wide cannot block a real fill, so it does not defeat the purpose of a stop. What it
+  does prevent is dumping the position into a book that has momentarily emptied out. Stellar
+  rejects a zero `destMin` anyway, so "no floor" is not actually on the menu.
+
+### exit.mjs
+
+```bash
+node exit.mjs --all --min-price 0.185          # preview
+node exit.mjs --all --min-price 0.185 --send   # actually do it
+```
+
+Cancels the resting XLM offers and sells, as **one transaction**. That is the whole point: XLM
+committed to a sell offer is locked, so cancelling and selling as two separate commands leaves a
+window where the offer is gone and the sale has not happened. Stellar applies a transaction's
+operations in order and all-or-nothing, so the cancel frees the XLM for the sale atomically.
+
+The sale is a strict-send path payment rather than an offer, because when exiting you want a fill
+rather than a queue position. `destMin` is a hard floor: if the book cannot beat it the entire
+transaction fails and you still hold everything, which is the right outcome. Give the floor
+explicitly with `--min-price`, or let `--slippage` derive it from the current book.
+
+It sizes the sale against the reserve *after* the cancels land, since cancelling an offer frees a
+subentry, and it refuses rather than guesses when the numbers do not work: a floor above the
+market, a size beyond the balance, or `--send` with no TTY and no `--yes`.
+
+Previews by default. Nothing is signed without `--send`.

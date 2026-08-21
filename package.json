@@ -7,12 +7,16 @@
   "bin": {
     "portfolio": "./portfolio.mjs",
     "bridge": "./bridge.mjs",
-    "ledger": "./ledger.mjs"
+    "ledger": "./ledger.mjs",
+    "watch": "./watch.mjs",
+    "exit-xlm": "./exit.mjs"
   },
   "scripts": {
     "start": "node portfolio.mjs",
     "bridge": "node bridge.mjs",
-    "ledger": "node ledger.mjs"
+    "ledger": "node ledger.mjs",
+    "watch": "node watch.mjs",
+    "exit": "node exit.mjs"
   },
   "engines": {
     "node": ">=18"

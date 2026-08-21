@@ -194,9 +194,20 @@ async function priceFromStellarExpert(book, assets) {
   }));
 }
 
-// Marginal DEX/AMM price: quote a single unit so the answer is not distorted by
-// the slippage a full-position quote would include.
-async function priceFromHorizonPaths(book, assets) {
+// How much notional the book must absorb before its marginal price is trusted, and how
+// far that size may move the price. A quote for one unit is meaningless if the only offer
+// behind it is worth a few cents.
+const DEX_DEPTH_USD = Number(process.env.DEX_DEPTH_USD ?? 250);
+const DEX_MAX_SLIPPAGE = Number(process.env.DEX_MAX_SLIPPAGE ?? 0.03);
+
+/**
+ * Price from the SDEX, asset to USDC, because that is the venue a Stellar-held balance can
+ * actually be sold on and so is what the holding is really worth today. Quotes a single
+ * unit for the marginal price, then re-quotes at a real size purely as a depth test: if
+ * ${DEX_DEPTH_USD} of notional moves the price more than the tolerance, the book is too
+ * thin to be a price at all and the key is left for a wider aggregate to fill.
+ */
+async function priceFromDex(book, assets) {
   for (const { code, issuer } of assets) {
     const key = stellarKey(code, issuer);
     if (book.has(key)) continue;
@@ -207,24 +218,46 @@ async function priceFromHorizonPaths(book, assets) {
     const source = issuer
       ? `source_asset_type=credit_alphanum${code.length > 4 ? 12 : 4}&source_asset_code=${code}&source_asset_issuer=${issuer}`
       : 'source_asset_type=native';
-    for (const probe of [1, 100, 10000]) {
-      try {
-        const body = await getJson(
-          `${HORIZON}/paths/strict-send?${source}&source_amount=${probe}` +
-          `&destination_assets=${USDC_CLASSIC.code}:${USDC_CLASSIC.issuer}`,
-        );
-        const best = (body._embedded?.records ?? [])
-          .map((r) => Number(r.destination_amount))
-          .filter((n) => n > 0)
-          .sort((a, b) => b - a)[0];
-        if (best) {
-          book.set(key, best / probe, `horizon-path(${probe})`);
+
+    const quote = async (units) => {
+      const body = await getJson(
+        `${HORIZON}/paths/strict-send?${source}&source_amount=${units}` +
+        `&destination_assets=${USDC_CLASSIC.code}:${USDC_CLASSIC.issuer}`,
+      );
+      return (body._embedded?.records ?? [])
+        .map((r) => Number(r.destination_amount))
+        .filter((n) => n > 0)
+        .sort((a, b) => b - a)[0];
+    };
+
+    try {
+      // Escalate the probe: some assets have no path for a single unit purely because of
+      // rounding, and a larger probe finds one.
+      let marginal;
+      let probed;
+      for (const units of [1, 100, 10000]) {
+        const got = await quote(units);
+        if (got) {
+          marginal = got / units;
+          probed = units;
           break;
         }
-      } catch (e) {
-        warn(`horizon path price failed for ${code}: ${e.message}`);
-        break;
       }
+      if (marginal === undefined) continue; // no SDEX route at all
+
+      const depthUnits = Math.max(probed, Math.ceil(DEX_DEPTH_USD / marginal));
+      const deep = await quote(depthUnits);
+      const slippage = deep === undefined ? 1 : 1 - deep / depthUnits / marginal;
+      if (slippage > DEX_MAX_SLIPPAGE) {
+        warn(
+          `sdex book for ${code} is too thin to price: $${DEX_DEPTH_USD} moves it ` +
+          `${(slippage * 100).toFixed(1)}%, using a wider price source instead`,
+        );
+        continue;
+      }
+      book.set(key, marginal, `sdex(${probed})`);
+    } catch (e) {
+      warn(`sdex price failed for ${code}: ${e.message}`);
     }
   }
 }
@@ -285,10 +318,17 @@ async function readStellarAccount(address) {
   for (const b of account.balances) {
     if (b.asset_type === 'liquidity_pool_shares') {
       lpShares.push({ poolId: b.liquidity_pool_id, shares: Number(b.balance) });
-    } else if (b.asset_type === 'native') {
-      holdings.push({ code: 'XLM', issuer: undefined, amount: Number(b.balance) });
     } else {
-      holdings.push({ code: b.asset_code, issuer: b.asset_issuer, amount: Number(b.balance) });
+      // Horizon's balance already includes anything committed to an offer, so the total is
+      // right either way. selling_liabilities is carried separately because a balance that
+      // is 97% spoken for reads very differently from one that is free.
+      const native = b.asset_type === 'native';
+      holdings.push({
+        code: native ? 'XLM' : b.asset_code,
+        issuer: native ? undefined : b.asset_issuer,
+        amount: Number(b.balance),
+        locked: Number(b.selling_liabilities ?? 0),
+      });
     }
   }
 
@@ -589,7 +629,8 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
     const rows = [];
     for (const h of account.holdings) {
       const v = value(stellarKey(h.code, h.issuer), h.amount, `${h.code} (Stellar)`);
-      rows.push({ label: h.code, amount: h.amount, ...v });
+      const locked = h.locked > 0 ? ` (${fmtQty(h.locked)} in offers)` : '';
+      rows.push({ label: `${h.code}${locked}`, amount: h.amount, ...v });
     }
     for (const pool of account.pools) {
       const usd = pool.reserves.reduce(
@@ -876,8 +917,8 @@ async function main() {
   const mints = [...new Set(solanaAccounts.flatMap((a) => [WSOL, ...a.tokens.map((t) => t.mint)]))];
 
   const [, solanaMeta] = await Promise.all([
-    priceFromStellarExpert(book, [...stellarAssets.values()])
-      .then(() => priceFromHorizonPaths(book, [...stellarAssets.values()])),
+    priceFromDex(book, [...stellarAssets.values()])
+      .then(() => priceFromStellarExpert(book, [...stellarAssets.values()])),
     mints.length ? priceSolana(book, mints) : Promise.resolve(new Map()),
   ]);
 
