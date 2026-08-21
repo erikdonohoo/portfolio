@@ -642,18 +642,35 @@ can be compared directly:
 
 ```
   positions the lot engine thinks you hold
-    where             asset            amount        basis        value    return    held        APR
-    blend:CDMAVJPF    USTRY        1,388.8377    $1,477.28    $1,489.65    +0.84%    119d     +2.56%
-    blend:CDMAVJPF    CETES       13,132.3588      $833.32      $914.44    +9.73%    244d    +14.54%
-    blend:CDMAVJPF    TESOURO      3,742.7529      $897.94      $900.34    +0.27%      2d        new
-    stellar           BLND          1,733.072       $93.08       $68.00   -26.95%    122d    -80.49%
-    backstop:CDMAVJPF LP share                     $979.44      $901.78    -7.93%    173d    -16.72%
-    blend:CDMAVJPF    USDC             -1,100   -$1,100.00   -$1,100.02    -0.00%      1d        new  borrowed
+    where             asset            amount        basis        value    return    held          APR
+    blend:CDMAVJPF    USTRY        1,388.8377    $1,477.28    $1,489.65    +0.84%    119d       +2.56%
+    blend:CDMAVJPF    CETES       13,132.3588      $833.32      $914.42    +9.73%    244d      +14.53%
+    blend:CDMAVJPF    TESOURO      3,742.7529      $897.94      $900.34    +0.27%      2d     ~+63.83%
+    stellar           XLM            535.2364      $102.29      $106.09    +3.72%      0d   ~+4174.17%
+    stellar           BLND          1,733.072       $93.08       $68.00   -26.94%    122d      -80.48%
+    backstop:CDMAVJPF LP share                     $979.44      $901.79    -7.93%    173d      -16.72%
+    blend:CDMAVJPF    USDC             -1,100   -$1,100.00   -$1,100.19    -0.02%      1d      ~-5.41%  borrowed
 ```
 
-`held` is the average age of a dollar in the position, not of the position. Each lot keeps the
-date and the cost it had when it went in, so a holding built in three deposits weights each one
-by its size. Annualising the return over that comes out as
+`held` is the average age of a **dollar** in the position, not of the position, and not the age
+of the oldest deposit. Each lot keeps the date and the cost it had when it went in, so a holding
+built in several deposits weights each one by its size. `--trace` shows the tranches behind any
+row:
+
+```
+$ node ledger.mjs --cached --trace blend:CDMAVJPF:CETES
+
+  tranches still open, oldest first
+    2025-12-14     12,110.1846  at     $0.06 each  =     $764.68   250.1d
+    2026-02-22      1,022.1743  at     $0.07 each  =      $68.64   180.7d
+                   13,132.3588  basis     $833.32   weighted age 244.4d
+```
+
+Neither 250 nor 181: `(764.68 x 250.1 + 68.64 x 180.7) / 833.32 = 244.4`. The second tranche is
+the YieldBlox supply interest, which arrived as income on the day the position closed and has
+been held since, at what it was worth that day.
+
+Annualising the return over that age comes out as
 
 ```
 APR = gain x 365 / sum(lot basis x lot age in days)
@@ -672,9 +689,12 @@ rather than the 244 days you have actually held it. Transfers now move lots rath
 them, and income is the one thing that does get today's date, because that is when you acquired
 it.
 
-Under a week it says `new` instead of a rate. A position one day old that moved 3% annualises to
-four figures, which describes the window and not the position. Under a cent of basis it says
-nothing at all, since a percentage of rounding is rounding.
+A `~` means the position is under a week old, so the rate describes the window rather than the
+position: two days of TESOURO annualises to whatever those two days did, and half a day of XLM
+to `~+4174%`. The number is still shown, because the age is sitting right next to it and
+withholding the figure while displaying the age is the worst of both. Nothing is suppressed
+except where the arithmetic has no meaning: under a cent of basis, or a window so short the
+denominator is essentially zero.
 
 Emissions are their own row, not folded into the position that earned them. That is deliberate:
 the CETES supply and the BLND it pays you are two different bets, and here one is up 14% a year

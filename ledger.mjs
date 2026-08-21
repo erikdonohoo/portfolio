@@ -1381,12 +1381,15 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {}, as
   // identical, and it is why these rates are comparable across positions of different sizes
   // built at different times.
   //
-  // Under a week it is suppressed. A position one day old that moved 3% annualises to four
-  // figures, which says nothing about the position and everything about the window.
+  // A short window is flagged rather than blanked. Two days of a bond position annualises to
+  // whatever those two days did, which is a bad estimate of the yield and a true statement
+  // about the window, and the reader can see the age sitting next to it. Withholding the
+  // number while showing the age is the worst of both.
   const apr = (basis, value, days) => {
-    // A cent of basis divided into a cent of gain is not a rate, it is rounding.
-    if (!(basis >= 0.01) || value === undefined || days === undefined || days < 7) return undefined;
-    return ((value - basis) / basis) * (365 / days);
+    // A cent of basis divided into a cent of gain is not a rate, it is rounding. Neither is
+    // a window so short the denominator is essentially zero.
+    if (!(basis >= 0.01) || value === undefined || !(days > 0.01)) return undefined;
+    return { rate: ((value - basis) / basis) * (365 / days), noisy: days < 7 };
   };
 
   let markedValue = 0;
@@ -1407,18 +1410,21 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {}, as
     // the mark comes from elsewhere, and it is added once per location below.
     const days = heldDays(list);
     if (opaqueLocations[chain] !== undefined) {
-      holdings.push({ chain, asset, amount, basis, days, value: undefined, opaque: true });
+      holdings.push({ chain, asset, amount, basis, days, tranches: list, value: undefined, opaque: true });
       continue;
     }
     const price = currentPrices[asset];
     if (price === undefined) {
       issues.push(`${asset} on ${chain}: holding ${amount.toFixed(6)} with no current price, its own mark is missing`);
-      holdings.push({ chain, asset, amount, basis, days, value: undefined, gain: undefined });
+      holdings.push({ chain, asset, amount, basis, days, tranches: list, value: undefined, gain: undefined });
       continue;
     }
     const value = amount * price;
     markedValue += value;
-    holdings.push({ chain, asset, amount, basis, days, value, gain: value - basis, apr: apr(basis, value, days) });
+    holdings.push({
+      chain, asset, amount, basis, days, tranches: list, value,
+      gain: value - basis, apr: apr(basis, value, days),
+    });
   }
 
   // Debt still outstanding is negative value. Marked at today's price so a debt that grew
@@ -1450,7 +1456,7 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {}, as
     // it, so the sign is flipped and this reads as the rate the borrow is charging you.
     outstanding.push({
       location, asset, amount, basis, value, days,
-      apr: value === undefined ? undefined : apr(basis, 2 * basis - value, days),
+      apr: apr(basis, value === undefined ? undefined : 2 * basis - value, days),
     });
     if (price !== undefined) markedValue -= value;
   }
@@ -2060,6 +2066,7 @@ async function main() {
       if (p !== undefined) currentPrices[asset] = p;
     }
 
+    let traced;
     const traceIndex = args.indexOf('--trace');
     if (traceIndex >= 0) {
       const want = args[traceIndex + 1];
@@ -2098,7 +2105,7 @@ async function main() {
         console.log(`  ${e.at}  ${String(e.kind).padEnd(14)} ${delta >= 0 ? '+' : ''}${delta.toFixed(7).padStart(15)}  -> ${bal.toFixed(7).padStart(15)}  ${e.tx ?? ''}`);
       }
       console.log(`  final ${wLoc}:${wAsset} = ${bal.toFixed(7)}`);
-      return 0;
+      traced = { loc: wLoc, asset: wAsset };
     }
     // The backstop is the one place value goes and stops being what it was: USDC and BLND
     // are swapped for a comet LP share whose price moves on its own, and the share never
@@ -2107,6 +2114,31 @@ async function main() {
       Object.entries(value.locations ?? {}).filter(([k]) => k.startsWith('backstop:')),
     );
     const result = runLots({ entries, currentPrices, marketValue: value.total, opaqueLocations });
+
+    // What the entry walk above left behind: the tranches still open, each with the date and
+    // the cost it had going in. "held" on the position table is the average of these weighted
+    // by basis, not the age of the oldest, so this is where to check it.
+    if (traced) {
+      const h = result.holdings.find((x) => x.chain === traced.loc && x.asset === traced.asset);
+      console.log('');
+      if (!h) {
+        console.log(`  nothing open at ${traced.loc}:${traced.asset}`);
+        return 0;
+      }
+      console.log(`  tranches still open, oldest first`);
+      const now = Date.now();
+      for (const l of h.tranches) {
+        const age = (now - Date.parse(l.at)) / 86400000;
+        console.log(
+          `    ${l.at.slice(0, 10)}  ${l.amount.toLocaleString('en-US', { maximumFractionDigits: 4 }).padStart(14)}` +
+          `  at ${usd(l.basisPerUnit).padStart(9)} each  = ${usd(l.amount * l.basisPerUnit).padStart(11)}` +
+          `  ${age.toFixed(1).padStart(6)}d`,
+        );
+      }
+      console.log(`    ${''.padStart(10)}  ${h.amount.toLocaleString('en-US', { maximumFractionDigits: 4 }).padStart(14)}` +
+        `  basis ${usd(h.basis).padStart(11)}   weighted age ${h.days === undefined ? 'n/a' : `${h.days.toFixed(1)}d`}`);
+      return 0;
+    }
 
     const drift0 = result.realised + result.earned + result.unrealised - gain;
     const reconciles = Math.abs(drift0) < 0.01;
@@ -2239,14 +2271,14 @@ async function main() {
           `  ${usd(basis).padStart(11)}  ${(typeof mark === 'number' ? usd(mark) : mark).padStart(11)}` +
           `  ${(ret === undefined ? '' : pct(ret * 100)).padStart(8)}` +
           `  ${(days === undefined ? '' : `${Math.round(days)}d`).padStart(6)}` +
-          `  ${(rate === undefined ? (days !== undefined && days < 7 ? 'new' : '') : pct(rate * 100)).padStart(9)}` +
+          `  ${(rate === undefined ? '' : `${rate.noisy ? '~' : ''}${pct(rate.rate * 100)}`).padStart(11)}` +
           (note ? `  ${note}` : ''),
         );
       };
       console.log(
         `    ${'where'.padEnd(17)} ${'asset'.padEnd(9)} ${'amount'.padStart(13)}` +
         `  ${'basis'.padStart(11)}  ${'value'.padStart(11)}  ${'return'.padStart(8)}` +
-        `  ${'held'.padStart(6)}  ${'APR'.padStart(9)}`,
+        `  ${'held'.padStart(6)}  ${'APR'.padStart(11)}`,
       );
       for (const h of [...result.holdings].sort((a, b) => (b.value ?? b.basis ?? 0) - (a.value ?? a.basis ?? 0))) {
         if (h.opaque) continue; // shown as its location below, since its parts cannot be marked
