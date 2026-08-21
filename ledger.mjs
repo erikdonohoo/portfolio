@@ -166,7 +166,7 @@ async function refreshStellarEffects(account, onProgress) {
   // append-only, so the only way to add a field to old rows is to fetch them again.
   const stale =
     cache.contracts === undefined ||
-    cache.credits.some((c) => c.tx === undefined) ||
+    cache.credits.some((c) => c.tx === undefined || (c.asset !== 'XLM' && c.issuer === undefined)) ||
     cache.trades.some((t) => t.op === undefined);
   if (stale) {
     cache.cursor = undefined;
@@ -240,7 +240,10 @@ async function refreshStellarEffects(account, onProgress) {
         at: e.created_at,
         tx: e.id?.split('-')[0],
         dir: e.type === 'account_credited' ? 'in' : 'out',
+        // The issuer is what makes a code priceable: the SDEX has an order book per
+        // (code, issuer) pair, and "BLND" on its own names nothing it can look up.
         asset: e.asset_code ?? (e.asset_type === 'native' ? 'XLM' : e.asset_type),
+        issuer: e.asset_issuer,
         amount,
       });
     }
@@ -640,27 +643,42 @@ async function sdexPriceAt(asset, issuer, at) {
   const base = issuer
     ? `base_asset_type=credit_alphanum${asset.length > 4 ? 12 : 4}&base_asset_code=${asset}&base_asset_issuer=${issuer}`
     : 'base_asset_type=native';
-  const counter =
-    `counter_asset_type=credit_alphanum4&counter_asset_code=USDC&counter_asset_issuer=${USDC_ISSUER}`;
 
-  const ms = Date.parse(at);
-  for (const resolution of [3600000, 86400000]) {
-    const start = Math.floor(ms / resolution) * resolution;
-    const url =
-      `${HORIZON}/trade_aggregations?${base}&${counter}` +
-      `&resolution=${resolution}&start_time=${start}&end_time=${start + resolution}&order=asc&limit=1`;
-    try {
-      const body = await getJson(url);
-      const record = body._embedded?.records?.[0];
-      // avg is volume weighted across the bucket, which is the fairest single number for
-      // a transfer that happened somewhere inside it.
-      const avg = Number(record?.avg);
-      if (Number.isFinite(avg) && avg > 0) return avg;
-    } catch {
-      return undefined;
+  const against = async (counter) => {
+    const ms = Date.parse(at);
+    for (const resolution of [3600000, 86400000]) {
+      const start = Math.floor(ms / resolution) * resolution;
+      const url =
+        `${HORIZON}/trade_aggregations?${base}&${counter}` +
+        `&resolution=${resolution}&start_time=${start}&end_time=${start + resolution}&order=asc&limit=1`;
+      try {
+        const body = await getJson(url);
+        const record = body._embedded?.records?.[0];
+        // avg is volume weighted across the bucket, which is the fairest single number for
+        // a transfer that happened somewhere inside it.
+        const avg = Number(record?.avg);
+        if (Number.isFinite(avg) && avg > 0) return avg;
+      } catch {
+        return undefined;
+      }
     }
-  }
-  return undefined;
+    return undefined;
+  };
+
+  const usdc = await against(
+    `counter_asset_type=credit_alphanum4&counter_asset_code=USDC&counter_asset_issuer=${USDC_ISSUER}`,
+  );
+  if (usdc !== undefined) return usdc;
+
+  // Plenty of Stellar assets have no USDC book at all and trade only against XLM. BLND is
+  // one: 263 trades against XLM on a day with none against USDC. Quoting it in XLM and
+  // converting is the difference between a real price and no price, and no price on an
+  // emissions claim means the whole position looks like it cost nothing.
+  if (asset === 'XLM' || !issuer) return undefined;
+  const inXlm = await against('counter_asset_type=native');
+  if (inXlm === undefined) return undefined;
+  const xlmUsd = await sdexPriceAt('XLM', undefined, at);
+  return xlmUsd === undefined ? undefined : inXlm * xlmUsd;
 }
 
 // Coinbase's public candles need no key and go back years, unlike CoinGecko's free tier
@@ -998,7 +1016,7 @@ function stellarMovements(effectsCache) {
     const group = byOp.get(k) ?? { at: c.at, op: k, moves: [], fromBalance: false, hasTrade: false };
     group.fromBalance = true;
     group.contract ??= contractByOp.get(k);
-    group.moves.push({ asset: c.asset, amount: c.dir === 'in' ? c.amount : -c.amount });
+    group.moves.push({ asset: c.asset, issuer: c.issuer, amount: c.dir === 'in' ? c.amount : -c.amount });
     byOp.set(k, group);
   }
   // A trade in an operation that produced no balance effect is a filled offer, which is
@@ -1023,8 +1041,13 @@ function stellarMovements(effectsCache) {
   return [...byOp.values()]
     .map((g) => {
       const net = new Map();
-      for (const m of g.moves) net.set(m.asset, (net.get(m.asset) ?? 0) + m.amount);
-      return { ...g, moves: [...net].map(([asset, amount]) => ({ asset, amount })).filter((m) => Math.abs(m.amount) > DUST) };
+      for (const m of g.moves) {
+        const row = net.get(m.asset) ?? { asset: m.asset, issuer: m.issuer, amount: 0 };
+        row.issuer ??= m.issuer;
+        row.amount += m.amount;
+        net.set(m.asset, row);
+      }
+      return { ...g, moves: [...net.values()].filter((m) => Math.abs(m.amount) > DUST) };
     })
     .filter((g) => g.moves.length)
     .sort((a, b) => a.at.localeCompare(b.at));
@@ -1045,11 +1068,12 @@ function loadStellarEffects(account, { refreshed }) {
   if (!cache) throw new Error(`no cached effects for ${account}, run without --cached`);
   const stale =
     cache.contracts === undefined ||
-    (cache.credits ?? []).some((c) => c.tx === undefined) ||
+    (cache.credits ?? []).some((c) => c.tx === undefined || (c.asset !== 'XLM' && c.issuer === undefined)) ||
     (cache.trades ?? []).some((t) => t.op === undefined);
   if (stale && !refreshed) {
     throw new Error(
-      `.ledger/${name}.json was written by an older version and is missing operation ids.\n` +
+      `.ledger/${name}.json was written by an older version and is missing fields the\n` +
+      '  movement builder needs.\n' +
       '  Run without --cached once and it will refetch itself.',
     );
   }
@@ -1086,8 +1110,10 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
   const debts = new Map(); // borrowed positions, same shape, owed rather than held
   const interestUnits = [];
   const disposals = [];
+  const earnings = [];
   const issues = [];
   let realised = 0;
+  let earned = 0;
 
   const key = (chain, asset) => `${chain}:${asset}`;
   const open = (chain, asset, at, amount, usdValue) => {
@@ -1249,9 +1275,28 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
         left -= take;
         if (lot.amount <= 1e-12) list.shift();
       }
-      // Coming back with more than went in is interest or emissions: earned units, no cost.
       if (left > 1e-9 && e.kind === 'to-contract') {
         issues.push(`${e.asset}: sent ${left.toFixed(4)} to a contract with no basis on record (${e.at.slice(0, 10)})`);
+      }
+      // Coming back with more than went in is emissions or interest: units you were given.
+      // They are not free money, they are income, and income has a value on the day it
+      // arrives. Booking them at zero leaves the whole position looking like pure profit
+      // forever and hides what has happened to the price since. Booking them at what they
+      // were worth recognises the income then, and lets the later move show as the gain or
+      // loss it is. The identity holds either way: basis created equals income recognised.
+      if (left > 1e-9 && e.kind === 'from-contract') {
+        const unit = e.unitPrice;
+        if (unit === undefined) {
+          issues.push(
+            `${e.asset}: received ${left.toFixed(4)} as income on ${e.at.slice(0, 10)} with no ` +
+            'price for that day, so it carries no basis',
+          );
+        } else {
+          const value = left * unit;
+          basis += value;
+          earned += value;
+          earnings.push({ chain: toLoc, asset: e.asset, at: e.at, amount: left, usd: value });
+        }
       }
       lots.set(key(fromLoc, e.asset), list);
       open(toLoc, e.asset, e.at, e.amount, basis);
@@ -1299,7 +1344,7 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
       open(e.toChain, e.asset, e.at, received, carried);
     }
     if (auditing) {
-      const leak = netBasisNow() - (realised + contributed);
+      const leak = netBasisNow() - (realised + earned + contributed);
       if (Math.abs(leak - leaked) > 0.005) {
         console.error(
           `  basis leak ${(leak - leaked).toFixed(4)}  ${e.at} ${e.kind} ` +
@@ -1310,7 +1355,7 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
     }
   }
 
-  if (auditing) console.error(`  basis leak, total ${(netBasisNow() - realised - contributed).toFixed(4)}`);
+  if (auditing) console.error(`  basis leak, total ${(netBasisNow() - realised - earned - contributed).toFixed(4)}`);
   let markedValue = 0;
   let openBasis = 0;
   const holdings = [];
@@ -1376,11 +1421,11 @@ function runLots({ entries, currentPrices, marketValue, opaqueLocations = {} }) 
   // markedValue is what the replay thinks its own holdings are worth, and the gap between
   // that and the portfolio is reported as a position check.
   const netBasis = openBasis - debtBasis;
-  const unrealised = marketValue === undefined ? markedValue - netBasis : marketValue - netBasis;
+  const unrealised = (marketValue === undefined ? markedValue : marketValue) - netBasis;
 
   return {
-    realised, unrealised, disposals, holdings, outstanding, interestUnits, issues,
-    openBasis, debtBasis, netBasis, markedValue, locationMarks,
+    realised, earned, unrealised, disposals, earnings, holdings, outstanding, interestUnits,
+    issues, openBasis, debtBasis, netBasis, markedValue, locationMarks,
   };
 }
 
@@ -1864,13 +1909,20 @@ async function main() {
               : m.amount > 0 ? 'from-contract' : 'to-contract';
             stellarEntries.push({
               kind, chain: 'stellar', pool: where, at: g.at, viaContract: g.contract,
-              asset: m.asset, amount: Math.abs(m.amount), tx: g.op,
+              asset: m.asset, issuer: m.issuer, amount: Math.abs(m.amount), tx: g.op,
             });
           }
         }
       }
     }
     for (const s of stellarEntries) {
+      // What a unit was worth when it arrived, for the part of a return that turns out to
+      // be income rather than your own money coming back. Fetched here because runLots is
+      // synchronous and this is a network call.
+      if (s.kind === 'from-contract') {
+        const { usd: p } = await priceOn(s.asset, s.at, s.issuer);
+        if (p !== undefined) s.unitPrice = p;
+      }
       if (s.kind === 'blend-borrow' || s.kind === 'blend-repay') {
         const { usd: p } = await priceOn(s.asset, s.at);
         if (p === undefined) s.skip = true;
@@ -2010,13 +2062,16 @@ async function main() {
     );
     const result = runLots({ entries, currentPrices, marketValue: value.total, opaqueLocations });
 
-    const drift0 = result.realised + result.unrealised - gain;
+    const drift0 = result.realised + result.earned + result.unrealised - gain;
     const reconciles = Math.abs(drift0) < 0.01;
     console.log('');
     console.log('FIFO cost basis');
     console.log(`  realised          ${usd(result.realised).padStart(14)}   from ${result.disposals.length} disposals`);
+    if (result.earned) {
+      console.log(`  earned            ${usd(result.earned).padStart(14)}   ${result.earnings.length} emissions and interest payments, valued when received`);
+    }
     console.log(`  unrealised        ${usd(result.unrealised).padStart(14)}   on what is still held`);
-    console.log(`  total             ${usd(result.realised + result.unrealised).padStart(14)}`);
+    console.log(`  total             ${usd(result.realised + result.earned + result.unrealised).padStart(14)}`);
     console.log('');
     // The whole engine either agrees with the aggregate figure or it is wrong.
     console.log(`  aggregate gain    ${usd(gain).padStart(14)}   (taken out + worth today - put in)`);
@@ -2037,7 +2092,17 @@ async function main() {
     console.log('  position check   the replay marks its own holdings against the portfolio');
     console.log(`    replay marks    ${usd(result.markedValue).padStart(14)}`);
     console.log(`    portfolio says  ${usd(value.total).padStart(14)}`);
-    console.log(`    drift           ${usd(positionDrift).padStart(14)}   ${Math.abs(positionDrift) < Math.max(1, value.total * 0.005) ? 'positions agree' : 'positions differ, see below'}`);
+    const agrees = Math.abs(positionDrift) < Math.max(1, value.total * 0.005);
+    console.log(`    drift           ${usd(positionDrift).padStart(14)}   ${agrees ? 'positions agree' : 'positions differ, see below'}`);
+    // Worth stating in the output, because the numbers below look like an error and are
+    // usually the opposite. Yield accrues inside a pool with no transaction to see, so the
+    // replay's quantity lags the chain until a withdrawal finally reveals it. Today's value
+    // already counts it, since that comes from the portfolio reading the chain: what lags is
+    // only which line it lands on, and it moves from unrealised to earned on the withdrawal.
+    if (agrees) {
+      console.log('    yield accruing inside a pool has no transaction, so the replay lags the');
+      console.log('    chain until a withdrawal reveals it. It is in the total either way.');
+    }
 
     // A total on its own says nothing about whether the replay is sound. Broken out per
     // holding it is obvious: pool interest and unclaimed emissions are value that accrued
@@ -2130,6 +2195,25 @@ async function main() {
       }
       for (const d of result.outstanding ?? []) {
         console.log(`    ${d.location.padEnd(16)} ${d.asset.padEnd(8)} ${(-d.amount).toLocaleString('en-US', { maximumFractionDigits: 4 }).padStart(14)}  owed`);
+      }
+    }
+
+    if (result.earnings?.length) {
+      const byAsset = new Map();
+      for (const e of result.earnings) {
+        const row = byAsset.get(e.asset) ?? { asset: e.asset, amount: 0, usd: 0, n: 0 };
+        row.amount += e.amount;
+        row.usd += e.usd;
+        row.n += 1;
+        byAsset.set(e.asset, row);
+      }
+      console.log('');
+      console.log('  earned, valued on the day it arrived');
+      for (const r of [...byAsset.values()].sort((a, b) => b.usd - a.usd)) {
+        console.log(
+          `    ${r.asset.padEnd(9)} ${r.amount.toLocaleString('en-US', { maximumFractionDigits: 4 }).padStart(14)}` +
+          `  ${usd(r.usd).padStart(10)} over ${r.n} payment${r.n === 1 ? '' : 's'}`,
+        );
       }
     }
 

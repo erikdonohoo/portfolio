@@ -490,12 +490,15 @@ Flows are valued on the day they happened, from whichever source knows that asse
 | USDC, USDT, EURC | par | n/a |
 | CETES, TESOURO, USTRY and the other Etherfuse bonds | `GET /lookup/bonds/history/{mint}`, `tokenPrice / usdExchangeRate` | daily |
 | MXNe | pegged 1:1 to the peso, so the ECB USD/MXN fixing | daily |
-| XLM and any classic Stellar asset | Horizon `/trade_aggregations` against USDC, volume weighted | **hourly** |
+| XLM and any classic Stellar asset | Horizon `/trade_aggregations` against USDC, or against XLM and converted | **hourly** |
 | SOL, BTC, ETH | Coinbase public candles | **hourly** |
 | anything else with a CoinGecko id | CoinGecko history, last 365 days only | daily |
 
 Stellar assets are priced off the SDEX rather than an off-network aggregate, for the same
-reason `portfolio.mjs` is: that is the venue the balance can actually be sold on. It also
+reason `portfolio.mjs` is: that is the venue the balance can actually be sold on. Plenty of
+them have no USDC book at all, so a miss there falls back to the XLM book and converts. BLND
+is the case that forced it: 263 trades against XLM on a day with none against USDC, and
+without the fallback every emissions claim priced at nothing. It also
 has no rate limit and can be asked for the specific hour a transfer landed, which matters on
 a volatile day. The 2025-11-21 XLM deposit prices at 0.2384205, the volume-weighted average
 of the 887 trades in that hour, against CoinGecko's 0.236809 for the day as a whole.
@@ -550,13 +553,48 @@ realised, and what is still open. `--summary` is how you skip it.
 
 ```
 FIFO cost basis
-  realised                 $161.07   from 82 disposals
-  unrealised               $106.38   on what is still held
-  total                    $267.45
+  realised                  $85.89   from 296 disposals
+  earned                   $175.41   33 emissions and interest payments, valued when received
+  unrealised                 $7.08   on what is still held
+  total                    $268.38
 
-  aggregate gain           $267.45   (taken out + worth today - put in)
+  aggregate gain           $268.38   (taken out + worth today - put in)
   difference                -$0.00   reconciles
 ```
+
+`earned` is the line that changes the story. Emissions and pool interest are units you were
+given, and the obvious thing to do with a unit that cost nothing is to give it a basis of
+zero. That is arithmetically consistent, and it is also how a position that has halved in
+price goes on reading as pure profit forever: 1,733 BLND showed `basis $0.00, value $67.95`,
+which says you are up $68 on it. Valued when it arrived, the same BLND cost $93.08. You are
+down $25 on it and were up $95 before that, and only the second version tells you what
+happened.
+
+So earned units are income at the price on the day they landed, and the price move afterwards
+is a separate gain or loss. The identity survives it: basis created equals income recognised,
+so `realised + earned + unrealised` still equals the aggregate exactly. The total never moves,
+which is the point. What moves is how much of it you can attribute.
+
+```
+  earned, valued on the day it arrived
+    BLND          1,765.4938      $95.12 over 21 payments
+    CETES         1,022.1743      $68.64 over 1 payment
+    USDC              11.654      $11.65 over 11 payments
+```
+
+`earned` is cash basis, not accrual. Yield accruing inside a pool produces no transaction, so
+the replay cannot attribute it until a withdrawal reveals it. **It is in the total the whole
+time**, because `unrealised` is `worth today - basis still open` and `worth today` comes from
+`portfolio.mjs` reading the b-token balance, which already includes every accrued unit. What a
+withdrawal changes is only which line it sits on: it moves from `unrealised` to `earned`, and
+the total does not move. The 1,022 CETES above is a decade of that at once, ten weeks of
+YieldBlox supply interest becoming attributable on the day the position closed.
+
+Two things it genuinely cannot see. Claiming emissions and depositing them in one transaction
+nets to zero at the wallet, so those never appear as income; they arrive inside the backstop's
+value instead, which is marked from the portfolio, so again the total is right and only the
+split is short. And an asset the replay cannot price on the day keeps a zero basis, reported
+as an issue rather than passed off as free money.
 
 The replay only ever touches basis, and basis is conserved: nothing but a contribution, a
 withdrawal or a realised gain may change it. That gives `openBasis - debtBasis = realised +
@@ -616,9 +654,10 @@ portfolio:
 
 The rows are signed the same way as the drift and add up to it. Positive means the replay
 thinks you hold more than the chain does. Most of what belongs here is value that accrued
-without a transaction to see: pool interest, unclaimed emissions. Anything large, or positive
-on an asset that only accrues, is a gap in the history rather than a valuation question, and
-`--trace` walks it back:
+without a transaction to see: pool interest, unclaimed emissions. None of it is missing from
+the total, since that side is read from the chain. Anything large, or positive on an asset
+that only accrues, is a gap in the history rather than a valuation question, and `--trace`
+walks it back:
 
 ```bash
 node ledger.mjs --cached --trace blend:CCCCIQSD:USDC
