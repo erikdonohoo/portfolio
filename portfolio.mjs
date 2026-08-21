@@ -22,7 +22,30 @@ import { Address, BASE_FEE, Contract, Keypair, Networks, TransactionBuilder, rpc
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const HORIZON = process.env.HORIZON_URL ?? 'https://horizon.stellar.org';
-const STELLAR_RPC = process.env.STELLAR_RPC_URL ?? 'https://mainnet.sorobanrpc.com';
+// Several endpoints, tried in turn. Public Soroban RPCs rate limit hard, and a partial
+// pool read produces a total that looks plausible and is wrong, so having somewhere else
+// to go matters more than it would for a read that fails loudly.
+const STELLAR_RPCS = (process.env.STELLAR_RPC_URLS ?? process.env.STELLAR_RPC_URL ?? [
+  'https://mainnet.sorobanrpc.com',
+  'https://soroban-rpc.mainnet.stellar.gateway.fm',
+  'https://rpc.ankr.com/stellar_soroban',
+].join(','))
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+let rpcIndex = 0;
+const STELLAR_RPC = STELLAR_RPCS[0];
+
+/** Move to the next endpoint. Returns false once every one has been tried. */
+function rotateStellarRpc(reason) {
+  if (rpcIndex + 1 >= STELLAR_RPCS.length) return false;
+  rpcIndex++;
+  warn(`stellar rpc ${STELLAR_RPCS[rpcIndex - 1]} failed (${reason}), switching to ${STELLAR_RPCS[rpcIndex]}`);
+  return true;
+}
+
+const currentStellarRpc = () => STELLAR_RPCS[rpcIndex];
 const SOLANA_RPC = process.env.SOLANA_RPC_URL ?? 'https://api.mainnet-beta.solana.com';
 
 const SPL_PROGRAMS = [
@@ -360,7 +383,8 @@ async function readStellarAccount(address) {
 
 /* ---------------------------------------------------------------- blend */
 
-const NETWORK = { rpc: STELLAR_RPC, passphrase: Networks.PUBLIC };
+// A getter, not a constant: rotating the endpoint has to affect calls made after it.
+const NETWORK = { get rpc() { return currentStellarRpc(); }, passphrase: Networks.PUBLIC };
 
 async function loadPool(poolId) {
   const metadata = await PoolMetadata.load(NETWORK, poolId);
@@ -406,7 +430,7 @@ async function claimableEmissions(poolId, pool, user) {
   }
   tokenIds.sort((a, b) => a - b);
 
-  const server = new rpc.Server(STELLAR_RPC);
+  const server = new rpc.Server(currentStellarRpc());
   const account = await server.getAccount(user);
   const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
     .addOperation(new Contract(poolId).call(
@@ -421,6 +445,21 @@ async function claimableEmissions(poolId, pool, user) {
   const sim = await server.simulateTransaction(tx);
   if (rpc.Api.isSimulationError(sim)) return undefined;
   return Number(scValToNative(sim.result.retval)) / 1e7;
+}
+
+/**
+ * Rate limiting on a pool read does not fail loudly: positions go missing and the total
+ * still looks like a number. So a failure is worth another endpoint before giving up.
+ */
+async function readBlendPoolWithFallback(poolId, users) {
+  for (;;) {
+    try {
+      return await readBlendPool(poolId, users);
+    } catch (e) {
+      const retryable = /429|too many|timeout|fetch failed|ECONN|502|503|504/i.test(e.message ?? '');
+      if (!retryable || !rotateStellarRpc(e.message?.slice(0, 40) ?? 'error')) throw e;
+    }
+  }
 }
 
 async function readBlendPool(poolId, users) {
@@ -482,6 +521,10 @@ async function readBlendPool(poolId, users) {
         deposited: bs.tokens,
         queued: queuedTokens,
         unlocked: bs.totalUnlockedQ4W,
+        // The comet pool the LP share is minted by. Anything reading a wallet's history
+        // sees value leaving for this contract and needs to know it stopped being USDC
+        // and BLND at that point.
+        lpToken: backstop.backstopToken.id,
         lpTokenPrice: backstop.backstopToken.lpTokenPrice,
         blndPerLpToken: backstop.backstopToken.blndPerLpToken,
         usdcPerLpToken: backstop.backstopToken.usdcPerLpToken,
@@ -536,7 +579,7 @@ async function readSolanaAccount(address) {
 /* ---------------------------------------------------------------- gulp emissions */
 
 async function gulpEmissions(poolId, version, sourceAddress, submit) {
-  const server = new rpc.Server(STELLAR_RPC);
+  const server = new rpc.Server(currentStellarRpc());
   const contract = new (version === 'V2' ? PoolContractV2 : PoolContractV1)(poolId);
   const parser = (version === 'V2' ? PoolContractV2 : PoolContractV1).parsers.gulpEmissions;
 
@@ -706,7 +749,11 @@ function buildReport(config, stellarAccounts, blendPools, solanaAccounts, book, 
         bsRows.push({ label: 'unclaimed emissions', amount: bs.emissions, ...v, pinned: true });
       }
       if (bsRows.length) {
-        sections.push({ title: `Blend backstop "${blend.name}" - ${blend.poolId}`, rows: bsRows });
+        sections.push({
+          title: `Blend backstop "${blend.name}" - ${blend.poolId}`,
+          lpToken: bs.lpToken,
+          rows: bsRows,
+        });
       }
     }
   }
@@ -884,7 +931,7 @@ async function main() {
       warn(`Stellar account ${a} failed: ${e.message}`);
       return { address: a, holdings: [], pools: [], claimables: [] };
     }))),
-    Promise.all(config.blendPools.map((p) => readBlendPool(p, config.stellar).catch((e) => {
+    Promise.all(config.blendPools.map((p) => readBlendPoolWithFallback(p, config.stellar).catch((e) => {
       warn(`Blend pool ${p} failed: ${e.message}`);
       return undefined;
     }))).then((list) => list.filter(Boolean)),

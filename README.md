@@ -414,10 +414,14 @@ script has never exercised.
 in yourself:
 
 ```bash
-node ledger.mjs --refresh   # fetch new history, then report
-node ledger.mjs             # report from cache
-node ledger.mjs --flows     # list every external flow
+node ledger.mjs             # fetch what is new, then report everything
+node ledger.mjs --cached    # skip the fetch, report from .ledger/
+node ledger.mjs --summary   # aggregate figures only, no cost basis
+node ledger.mjs --flows     # also list every external flow
 ```
+
+The default is the run you want almost every time, so it is what you get without asking. The
+flags turn work off rather than on.
 
 ```
 put in                  $3,967.85   20 transfers in
@@ -451,6 +455,23 @@ are ignored. Concretely:
   payment/swap distinction. One asset down and another up in the same transaction is a swap.
   The fee is added back first, and sub-0.03 SOL moves are treated as rent noise, so closing a
   token account does not read as a withdrawal.
+
+  Getting the transaction list right matters more than the classification. `getSignaturesForAddress`
+  on the wallet address is **structurally blind to incoming token transfers**: an SPL transfer into
+  your wallet names the sender, the sender's token account and your token account, and your wallet
+  address appears nowhere in it. On one wallet that hid 8 transactions on the USDC account alone,
+  every one of them money arriving, which is the worst thing to miss when the question is how much
+  you put in. Value that arrives invisibly and leaves visibly is reported as profit.
+
+  So the walk covers the owner **and** every token account: the current ones from
+  `getTokenAccountsByOwner` across both token programs, plus derived associated addresses for every
+  mint already seen so accounts since closed stay reachable. Signatures are deduped across all of
+  them. The cache keeps a `seen` set rather than a single high-water mark, because each address has
+  its own independent history and one marker cannot describe them all.
+
+  Still a blind spot: a token that arrived, had its account closed, and left no trace of its mint
+  anywhere in the cached events. There is nothing left to derive an address from, and finding it
+  would need an indexer rather than public RPC.
 - **Between your own wallets**: an outflow on one chain that reappears on the other within six
   hours, same asset, within 2%, is the same money moving. Those pairs cancel instead of counting
   as a withdrawal plus a fresh deposit. This is what catches the CCTP bridge.
@@ -490,6 +511,148 @@ accrued since. A price is only reported as unavailable if a fresh pull still doe
 date. A fetch failure and a genuinely unknown price are also reported differently, because
 treating them the same is how a rate limit becomes a quietly wrong total.
 
+### Time weighted return
+
+```
+gain                      $466.88   +11.81% of everything put in
+time weighted             +16.38% over 0.9y, +18.84% a year
+average capital         $2,850.99   what was actually at work, weighted by how long
+```
+
+The second line is **Modified Dietz**, which weights every deposit and withdrawal by the fraction
+of the period it was actually invested. `average capital` is the denominator it uses: money that
+arrived last month barely counts toward producing this year's return, and money withdrawn early
+stops counting from then on. On these wallets it is well under `put in`, because most of the
+deposits are recent.
+
+It is not IRR, deliberately. IRR solves a polynomial whose root count follows the number of sign
+changes in the cashflows, so a wallet with dozens of interleaved deposits and withdrawals can
+admit several answers, or one absurd one: a dollar in and two dollars out a day later has an
+exact IRR near 10^107 percent per year. Modified Dietz always has exactly one value and needs no
+solver, which is why it is the standard fallback for irregular flows. For a single deposit the
+two agree exactly, which is a useful check: 100 growing to 342 over two years gives +84.9% a
+year either way.
+
+Two cases where it declines to answer rather than guess:
+
+- **Average capital is not positive.** Possible on a leg that returned more than was ever
+  committed, where there is no meaningful capital base to divide by.
+- **The period return is under -100%.** Annualising means raising `1 + R` to a fractional power,
+  and a negative base has no real root. Reporting nothing beats reporting `NaN`.
+
+Per chain, a bridge transfer counts as a cashflow for both legs: it left one chain as surely as a
+withdrawal did. Leaving it out made the sending chain look like it had lost the money outright.
+
+### Cost basis, and the two numbers that have to agree
+
+Every run replays the transactions as FIFO lots: what each holding cost, what closing it
+realised, and what is still open. `--summary` is how you skip it.
+
+```
+FIFO cost basis
+  realised                 $161.07   from 82 disposals
+  unrealised               $106.38   on what is still held
+  total                    $267.45
+
+  aggregate gain           $267.45   (taken out + worth today - put in)
+  difference                -$0.00   reconciles
+```
+
+The replay only ever touches basis, and basis is conserved: nothing but a contribution, a
+withdrawal or a realised gain may change it. That gives `openBasis - debtBasis = realised +
+putIn - tookOut` for any input at all, so defining `unrealised = worthToday - (openBasis -
+debtBasis)` makes the two totals identical by construction. A difference on that line is
+therefore never missing history. It means something in the replay created or destroyed basis
+outside `open()` and `close()`, and `LEDGER_INVARIANT=1` will name the entry that did it.
+
+Two cases used to. A repayment larger than the recorded debt pro-rated what you handed over
+to the matched portion, which made accrued borrow interest vanish instead of being realised
+as the loss it is. And a disposal of more units than were ever acquired charged itself at
+proceeds so it would realise nothing, which sounds prudent and is not: put in never rose for
+units nobody saw arrive, so the aggregate books their proceeds as pure gain, and the replay
+has to as well. The units are still wrong, and that is what the position check below is for.
+
+### Where the replay thinks value is
+
+Basis travels with the asset, so a supply, a withdrawal, a backstop deposit and an emissions
+claim are all transfers rather than disposals. Each one lands somewhere:
+
+| location | what it holds |
+| --- | --- |
+| `stellar`, `solana` | the wallets themselves, net of fees and rent |
+| `blend:<pool>` | supplied to a Blend pool in `wallets.json` |
+| `backstop:<pool>` | swapped for that pool's BLND-USDC LP share |
+| `invested` | a contract nothing in the config names |
+
+The counterparty comes from Horizon's `contract_credited` and `contract_debited` effects,
+which sit on a different effect from the balance change, so they are cached as their own list
+and joined by operation id. Without that every contract looks alike and a backstop deposit is
+indistinguishable from a supply.
+
+`backstop:` is the one location the replay cannot mark itself. USDC and BLND go into the comet
+contract and come back as an LP share that never touches the wallet, so no effect records it
+and its price moves on its own afterwards. Its basis is still exact; only the mark comes from
+`portfolio.mjs`.
+
+Value in `invested` means a contract you have not named. The portfolio has no reason to look
+at it, so the report lists the contract addresses to add to `blendPools`.
+
+### The position check
+
+Basis and quantity are different claims, and only the second can be wrong without the
+arithmetic noticing. So the replay marks its own holdings and compares that against the
+portfolio:
+
+```
+  position check   the replay marks its own holdings against the portfolio
+    replay marks         $4,294.37
+    portfolio says       $4,285.69
+    drift                    $8.68   positions agree
+      blend:CCCCIQSD     USDC          $12.23   replay 12.232 vs chain 0
+      blend:CDMAVJPF     USTRY         -$3.15   replay 1,388.8377 vs chain 1,391.7785
+      blend:CDMAVJPF     unclaimed     -$0.25   replay 0 vs chain 6.4431
+      solana             SOL            $0.05   replay 0.056 vs chain 0.0555
+```
+
+The rows are signed the same way as the drift and add up to it. Positive means the replay
+thinks you hold more than the chain does. Most of what belongs here is value that accrued
+without a transaction to see: pool interest, unclaimed emissions. Anything large, or positive
+on an asset that only accrues, is a gap in the history rather than a valuation question, and
+`--trace` walks it back:
+
+```bash
+node ledger.mjs --cached --trace blend:CCCCIQSD:USDC
+```
+
+That prints every entry that moved the holding and the running balance after it, which is how
+two operations one second apart turned out to be collapsing into one.
+
+One class of drift can never be walked back, because the transaction is not yours. A liquidation
+seizes collateral inside the liquidator's transaction: it touches neither your operations nor
+your effects, so the replay goes on holding a position the pool has already taken. That is what
+`adjustments` in `wallets.json` is for. Take the amount straight off the position check, since
+a row reading `replay 12.232 vs chain 0` is telling you the number:
+
+```json
+"adjustments": [
+  { "at": "2026-02-22T05:31:39Z", "location": "blend:CCCCIQSD", "asset": "USDC",
+    "amount": -12.232, "usd": 0, "note": "liquidated, collateral seized against a borrow" }
+]
+```
+
+Negative means the units left, `usd` is what you got for them, which for a seizure is nothing.
+The basis then realises as the loss it was instead of sitting in unrealised forever. Each one is
+printed under the position check on every run, so a hand correction can never quietly become
+part of the furniture.
+
+What used to sit at the top of that list was the network's own cut, so it is modelled rather
+than tolerated. Stellar fees exist on no operation, payment or effect: the transaction record
+is the only place they appear, which is why there is a separate fee cache. On Solana the
+equivalent is rent, and it is the larger of the two, since every token account you open costs
+about 0.002 SOL and every one you close hands it back. Both are read the same way the flow and
+swap readers read a transaction, so what gets booked is exactly what those two left behind.
+Together they were 2.3 XLM on one wallet and a quarter of a SOL on another.
+
 ### Why an unpriced flow is not a rounding error
 
 A flow counted as $0 does not just lose a little precision, it corrupts the answer in a known
@@ -508,17 +671,32 @@ anywhere will always land here.
 
 Two things this number is not:
 
-- **It is not a time-weighted return.** Deposits landed on different dates, so 11.65% is total
-  gain over contributions, not an annualized rate. Money that arrived in March has not been
-  working as long as money from November.
+- **The headline percentage has no time in it.** `gain / put in` says that $100 earning $242
+  over three years and the same $100 earning it over three months performed identically. That
+  is what the `time weighted` line is for.
 - **It assumes every external counterparty is a third party.** A transfer to another wallet you
   own that is not in `wallets.json` reads as a withdrawal. Add every wallet you control.
 
 History is cached under `.ledger/` (gitignored). Both chains are append-only, so a refresh only
 fetches what is new: Stellar resumes from the stored Horizon cursor, Solana stops walking
 signatures once it reaches the newest one already cached, and mints only resolve symbols not seen
-before. `--refresh` prints what each source holds and how much of it is new. The first run walks
-everything and takes a few minutes on public endpoints.
+before. A refresh prints what each source holds and how much of it is new. The first run walks
+everything and takes a few minutes on public endpoints, which is what `--cached` is for
+afterwards.
+
+A cursor makes a cache append-only, so a field added to the reader cannot reach the rows already
+written. Rather than leave those rows silently short a column, the effects reader checks for the
+field and refetches from scratch when it is missing. That is how operation ids and contract
+counterparties got onto history that had been cached without them, and it means an existing
+`.ledger/` never needs deleting: one ordinary run repairs it.
+
+Only a refresh runs the fetcher, though, so `--cached` cannot repair anything. It checks the same
+fields and refuses rather than reading a cache the movement builder would quietly misgroup.
+
+`ledger.mjs` runs `portfolio.mjs` for today's value and refuses the run if it came back short.
+Every figure in the report is `worth today` minus something, so a Soroban RPC that rate limits
+mid run drops a Blend pool and takes a few thousand dollars with it, which reads as a
+catastrophic loss rather than as the error it is. It retries a few times first.
 
 ## Watching a price, and getting out
 

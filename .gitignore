@@ -4,3 +4,4 @@ node_modules/
 .bridge/
 wallets.json
 .ledger/
+.landon.json

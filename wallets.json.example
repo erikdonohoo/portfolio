@@ -8,5 +8,15 @@
   "blendPools": [
     "CDMAVJPFXPADND3YRL4BSM3AKZWCTFMX27GLLXCML3PD62HEQS5FPVAI",
     "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD"
-  ]
+  ],
+
+  "//adjustments": [
+    "Only for value that moved without this wallet's history recording it. A liquidation is",
+    "the usual case: the collateral is seized inside someone else's transaction, so it shows",
+    "up in neither your operations nor your effects. Run `ledger.mjs --lots` first and take",
+    "the number from the position check: a row reading `replay 12.232 vs chain 0` is telling",
+    "you the amount. Negative means it left; usd is what you got for it, zero for a seizure.",
+    "location is stellar, solana, blend:<first 8 of the pool id>, or backstop:<first 8>."
+  ],
+  "adjustments": []
 }
